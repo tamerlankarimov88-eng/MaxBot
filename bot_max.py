@@ -834,13 +834,13 @@ class DutyBot:
                 format=TextFormat.HTML
             )
 
-    # ============= ДИАГНОСТИЧЕСКИЕ КОМАНДЫ ДЛЯ @Tamerlantcik =============
+    # ============= ДИАГНОСТИЧЕСКИЕ КОМАНДЫ ДЛЯ СУПЕР-АДМИНА =============
 
     async def check_users_status(self, event: MessageCreated):
         sender = event.message.sender
         if not self.is_super_admin(sender.username):
             await event.message.answer(
-                "❌ <b>ДОСТУП ЗАПРЕЩЕН</b>\n\nЭта команда доступна только @Tamerlantcik",
+                f"❌ <b>ДОСТУП ЗАПРЕЩЕН</b>\n\nЭта команда доступна только {SUPER_ADMIN_USERNAME}",
                 format=TextFormat.HTML
             )
             return
@@ -1491,7 +1491,7 @@ class DutyBot:
             f"<b>Список сотрудников:</b>\n{employees_list}\n\n"
             "<i>Для изменения телефона отправьте сообщение в формате:</i>\n\n"
             "<code>ФИО;новый телефон</code>\n\n"
-            "<b>Пример:</b>\n<code>Денисова Е.С.;8-987-294-93-24</code>\n\n"
+            "<b>Пример:</b>\n<code>Иванов И.И.;8-900-000-00-00</code>\n\n"
             "<i>Отправьте данные или нажмите 'Отмена':</i>"
         )
         kb = InlineKeyboardBuilder()
