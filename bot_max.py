@@ -329,6 +329,8 @@ class AdminWizard(StatesGroup):
     awaiting_employee_add = State()
     awaiting_employee_remove = State()
     awaiting_phone_edit = State()
+    awaiting_protocol_upload = State()
+    awaiting_protocol_pin = State()
 
 
 class DutyBot:
@@ -374,8 +376,11 @@ class DutyBot:
         dp.message_created(AdminWizard.awaiting_employee_add)(self.wizard_employee_add)
         dp.message_created(AdminWizard.awaiting_employee_remove)(self.wizard_employee_remove)
         dp.message_created(AdminWizard.awaiting_phone_edit)(self.wizard_phone_edit)
+        dp.message_created(AdminWizard.awaiting_protocol_upload)(self.wizard_protocol_upload)
+        dp.message_created(AdminWizard.awaiting_protocol_pin)(self.wizard_protocol_pin)
 
-        # Загрузка/прикрепление файла протокола (должно идти раньше общего фолбэка)
+        # Файл прислан без активного состояния мастера — подскажем, что делать
+        # (должно идти раньше общего текстового фолбэка)
         dp.message_created(F.message.body.attachments)(self.on_document)
 
         # Фолбэк для любого текста вне активного состояния мастера
@@ -1545,20 +1550,19 @@ class DutyBot:
         kb.row(CallbackButton(text="🔙 Назад", payload="admin_employees"))
         await message.edit(text=text, attachments=[kb.as_markup()], format=TextFormat.HTML)
 
-    async def admin_upload_protocol(self, message, user_id, context=None):
+    async def admin_upload_protocol(self, message, user_id, context: BaseContext):
         text = (
             "📤 <b>ЗАГРУЗКА ПРОТОКОЛА</b>\n\n"
-            "<i>Для загрузки файла протокола:</i>\n\n"
-            "1. Отправьте файл в этот чат\n"
-            "2. В тексте к файлу напишите <code>протокол</code>\n\n"
-            "Файл будет автоматически сохранен.\n\n"
+            "Пришлите следующим сообщением файл протокола (без подписи — "
+            "в MAX нельзя прикрепить текст к файлу).\n\n"
+            "Бот сохранит именно следующий присланный файл.\n\n"
             "<b>Формат файла:</b> .docx\n"
             "<b>Рекомендуемое имя:</b> Протокол разногласий — пример.docx"
         )
         kb = InlineKeyboardBuilder()
-        kb.row(CallbackButton(text="🔙 Назад", payload="admin_files"))
-        kb.row(CallbackButton(text="📄 Проверить файл", payload="admin_check_protocol"))
+        kb.row(CallbackButton(text="❌ Отмена", payload="admin_files"))
         await message.edit(text=text, attachments=[kb.as_markup()], format=TextFormat.HTML)
+        await context.set_state(AdminWizard.awaiting_protocol_upload)
 
     async def admin_delete_protocol(self, message, user_id, context=None):
         if os.path.exists(self.protocol_file_path):
@@ -1601,7 +1605,7 @@ class DutyBot:
         kb.row(CallbackButton(text="📤 Загрузить протокол", payload="admin_upload_protocol"))
         await message.edit(text=text, attachments=[kb.as_markup()], format=TextFormat.HTML)
 
-    async def admin_pin_protocol(self, message, user_id, context=None):
+    async def admin_pin_protocol(self, message, user_id, context: BaseContext):
         if not os.path.exists(self.protocol_file_path):
             text = "❌ <b>ФАЙЛ НЕ НАЙДЕН</b>\n\nСначала загрузите файл протокола.\nИспользуйте кнопку 'Загрузить протокол'."
             kb = InlineKeyboardBuilder()
@@ -1612,14 +1616,13 @@ class DutyBot:
 
         text = (
             "📎 <b>ПРИКРЕПЛЕНИЕ ПРОТОКОЛА</b>\n\n"
-            "Для прикрепления протокола в закрепленное сообщение:\n\n"
-            "1. Отправьте боту файл протокола\n"
-            "2. В тексте к файлу напишите <code>закрепить</code>\n\n"
-            "Сообщение с файлом будет автоматически закреплено в чате."
+            "Пришлите следующим сообщением файл протокола (без подписи) — "
+            "бот закрепит именно это сообщение в чате."
         )
         kb = InlineKeyboardBuilder()
-        kb.row(CallbackButton(text="🔙 Назад", payload="admin_files"))
+        kb.row(CallbackButton(text="❌ Отмена", payload="admin_files"))
         await message.edit(text=text, attachments=[kb.as_markup()], format=TextFormat.HTML)
+        await context.set_state(AdminWizard.awaiting_protocol_pin)
 
     # ================= ПОШАГОВЫЙ МАСТЕР (текстовые шаги) =================
 
@@ -1782,11 +1785,95 @@ class DutyBot:
 
     # ================= ФАЙЛЫ ПРОТОКОЛА (входящие вложения) =================
 
+    @staticmethod
+    def _get_attachment_filename(attachment) -> str:
+        return getattr(attachment, "filename", None) or ""
+
+    @staticmethod
+    def _get_attachment_url(attachment) -> Optional[str]:
+        payload = getattr(attachment, "payload", None)
+        return getattr(payload, "url", None)
+
+    async def wizard_protocol_upload(self, event: MessageCreated, context: BaseContext):
+        """Файл, присланный сразу после кнопки «Загрузить протокол» (без подписи —
+        в MAX нельзя прикрепить текст к файлу, поэтому используем состояние мастера)."""
+        body = event.message.body
+        attachments = body.attachments if body else None
+        await context.clear()
+
+        if not attachments:
+            await event.message.answer(
+                "❌ <b>ЭТО НЕ ФАЙЛ</b>\n\nНажмите «Загрузить протокол» ещё раз и пришлите файл .docx.",
+                format=TextFormat.HTML
+            )
+            return
+
+        attachment = attachments[0]
+        filename = self._get_attachment_filename(attachment)
+
+        if not filename.endswith(".docx"):
+            await event.message.answer(
+                "❌ <b>НЕВЕРНЫЙ ФОРМАТ ФАЙЛА</b>\n\nПоддерживаются только файлы .docx",
+                format=TextFormat.HTML
+            )
+            return
+
+        url = self._get_attachment_url(attachment)
+        if not url:
+            await event.message.answer("❌ <b>ОШИБКА ЗАГРУЗКИ:</b> файл недоступен для скачивания",
+                                        format=TextFormat.HTML)
+            return
+
+        try:
+            downloaded_path = await self.bot.download_file(url, self.download_dir)
+            shutil.move(str(downloaded_path), self.protocol_file_path)
+            size_kb = os.path.getsize(self.protocol_file_path) / 1024
+            await event.message.answer(
+                f"✅ <b>ФАЙЛ ПРОТОКОЛА ЗАГРУЖЕН</b>\n\n📄 Имя файла: {filename}\n📁 Размер: {size_kb:.1f} КБ\n\n<i>Файл успешно сохранен и доступен для скачивания.</i>",
+                format=TextFormat.HTML
+            )
+        except Exception as e:
+            await event.message.answer(f"❌ <b>ОШИБКА ЗАГРУЗКИ:</b> {str(e)}", format=TextFormat.HTML)
+
+    async def wizard_protocol_pin(self, event: MessageCreated, context: BaseContext):
+        """Файл, присланный сразу после кнопки «Прикрепить протокол»."""
+        body = event.message.body
+        attachments = body.attachments if body else None
+        await context.clear()
+
+        if not attachments:
+            await event.message.answer(
+                "❌ <b>ЭТО НЕ ФАЙЛ</b>\n\nНажмите «Прикрепить протокол» ещё раз и пришлите файл .docx.",
+                format=TextFormat.HTML
+            )
+            return
+
+        filename = self._get_attachment_filename(attachments[0])
+        if not filename.endswith(".docx"):
+            await event.message.answer(
+                "❌ <b>НЕВЕРНЫЙ ФОРМАТ ФАЙЛА</b>\n\nПоддерживаются только файлы .docx",
+                format=TextFormat.HTML
+            )
+            return
+
+        try:
+            chat_id = event.message.recipient.chat_id
+            mid = body.mid
+            await self.bot.pin_message(chat_id=chat_id, message_id=mid)
+            self.protocol_pinned_message_id = mid
+            await event.message.answer(
+                f"✅ <b>ФАЙЛ ПРОТОКОЛА ПРИКРЕПЛЕН</b>\n\n📄 Имя файла: {filename}\n\n<i>Сообщение с файлом закреплено в чате.</i>",
+                format=TextFormat.HTML
+            )
+        except Exception as e:
+            await event.message.answer(f"❌ <b>ОШИБКА ПРИКРЕПЛЕНИЯ:</b> {str(e)}", format=TextFormat.HTML)
+
     async def on_document(self, event: MessageCreated):
+        """Файл прислан вне мастера (например, случайно) — просто подсказываем, как загрузить протокол."""
         sender = event.message.sender
         user_id = str(sender.user_id) if sender else None
         if not user_id or not self.is_admin(user_id):
-            return  # обычный пользователь прислал файл — молча игнорируем, как и раньше
+            return  # обычный пользователь прислал файл — молча игнорируем
 
         if not self.admin_sessions.get(user_id, {}).get("logged_in"):
             # Админ-сессия хранится только в памяти процесса и слетает при каждом
@@ -1799,62 +1886,13 @@ class DutyBot:
             )
             return
 
-        body = event.message.body
-        attachments = body.attachments if body else None
-        if not attachments:
-            return
-
-        attachment = attachments[0]
-        filename = getattr(attachment, "filename", None) or ""
-        caption = (body.text or "").strip().lower()
-
-        if caption not in ("протокол", "protocol", "закрепить", "pin", "прикрепить"):
-            await event.message.answer(
-                "ℹ️ <b>ФАЙЛ ПОЛУЧЕН, НО НЕ ОБРАБОТАН</b>\n\n"
-                "Чтобы бот сохранил файл — отправьте его ещё раз с подписью "
-                "<code>протокол</code> (сохранить) или <code>закрепить</code> "
-                "(закрепить в чате).",
-                format=TextFormat.HTML
-            )
-            return
-
-        if not filename.endswith(".docx"):
-            await event.message.answer(
-                "❌ <b>НЕВЕРНЫЙ ФОРМАТ ФАЙЛА</b>\n\nПоддерживаются только файлы .docx",
-                format=TextFormat.HTML
-            )
-            return
-
-        if caption in ("протокол", "protocol"):
-            payload = getattr(attachment, "payload", None)
-            url = getattr(payload, "url", None)
-            if not url:
-                await event.message.answer("❌ <b>ОШИБКА ЗАГРУЗКИ:</b> файл недоступен для скачивания",
-                                            format=TextFormat.HTML)
-                return
-            try:
-                downloaded_path = await self.bot.download_file(url, self.download_dir)
-                shutil.move(str(downloaded_path), self.protocol_file_path)
-                size_kb = os.path.getsize(self.protocol_file_path) / 1024
-                await event.message.answer(
-                    f"✅ <b>ФАЙЛ ПРОТОКОЛА ЗАГРУЖЕН</b>\n\n📄 Имя файла: {filename}\n📁 Размер: {size_kb:.1f} КБ\n\n<i>Файл успешно сохранен и доступен для скачивания.</i>",
-                    format=TextFormat.HTML
-                )
-            except Exception as e:
-                await event.message.answer(f"❌ <b>ОШИБКА ЗАГРУЗКИ:</b> {str(e)}", format=TextFormat.HTML)
-
-        else:  # закрепить / pin / прикрепить
-            try:
-                chat_id = event.message.recipient.chat_id
-                mid = body.mid
-                await self.bot.pin_message(chat_id=chat_id, message_id=mid)
-                self.protocol_pinned_message_id = mid
-                await event.message.answer(
-                    f"✅ <b>ФАЙЛ ПРОТОКОЛА ПРИКРЕПЛЕН</b>\n\n📄 Имя файла: {filename}\n\n<i>Сообщение с файлом закреплено в чате.</i>",
-                    format=TextFormat.HTML
-                )
-            except Exception as e:
-                await event.message.answer(f"❌ <b>ОШИБКА ПРИКРЕПЛЕНИЯ:</b> {str(e)}", format=TextFormat.HTML)
+        await event.message.answer(
+            "ℹ️ <b>ФАЙЛ ПОЛУЧЕН, НО НЕ ОБРАБОТАН</b>\n\n"
+            "Чтобы бот сохранил или закрепил файл — сначала откройте "
+            "<i>Админ-панель → Управление файлами</i> и нажмите нужную кнопку, "
+            "а уже потом присылайте файл.",
+            format=TextFormat.HTML
+        )
 
     # ================= ФОЛБЭК ДЛЯ ОБЫЧНОГО ТЕКСТА =================
 
