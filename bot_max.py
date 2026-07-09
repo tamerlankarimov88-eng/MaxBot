@@ -37,6 +37,7 @@ from maxapi.enums.parse_mode import TextFormat
 from maxapi.filters.command import Command, CommandStart
 from maxapi.types.attachments.buttons.callback_button import CallbackButton
 from maxapi.types.input_media import InputMedia
+from maxapi.types.updates.bot_started import BotStarted
 from maxapi.types.updates.message_callback import MessageCallback
 from maxapi.types.updates.message_created import MessageCreated
 from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
@@ -351,6 +352,7 @@ class DutyBot:
     def _register_handlers(self):
         dp = self.dp
 
+        dp.bot_started()(self.on_bot_started)
         dp.message_created(CommandStart())(self.start)
         dp.message_created(Command("admin"))(self.admin_login)
         dp.message_created(Command("test_wednesday"))(self.send_test_wednesday)
@@ -741,17 +743,17 @@ class DutyBot:
         parts = text.split()
         return parts[1:] if len(parts) > 1 else []
 
-    async def start(self, event: MessageCreated):
-        sender = event.message.sender
-        user_id = str(sender.user_id)
-        username = sender.username
-
+    def _register_user_and_build_welcome(self, user_id: str, username: Optional[str],
+                                          first_name: Optional[str], last_name: Optional[str]):
+        """Регистрирует пользователя (если это первый заход) и собирает текст+клавиатуру
+        приветственного меню. Используется и командой /start, и авто-показом меню при
+        открытии чата с ботом (BotStarted) — единая точка правды для обоих путей."""
         if user_id not in self.user_data:
             self.user_data[user_id] = {
                 "username": username,
-                "first_name": sender.first_name,
-                "last_name": sender.last_name,
-                "display_name": f"{sender.first_name or ''} {sender.last_name or ''}".strip(),
+                "first_name": first_name,
+                "last_name": last_name,
+                "display_name": f"{first_name or ''} {last_name or ''}".strip(),
                 "notifications": True,
                 "selected_employee": None,
                 "registered_at": datetime.now().isoformat(),
@@ -774,32 +776,48 @@ class DutyBot:
 
         if employee_name:
             welcome_text = (
-                f"<b>ДОБРО ПОЖАЛОВАТЬ, {sender.first_name}!</b>\n\n"
+                f"<b>ДОБРО ПОЖАЛОВАТЬ, {first_name}!</b>\n\n"
                 f"👤 <b>Ваш профиль:</b>\n"
                 f"• Сотрудник: {employee_name}\n"
                 f"• Телефон: {EMPLOYEE_PHONES.get(employee_name, 'не указан')}\n"
                 f"• Уведомления: {'✅ Включены' if user_info.get('notifications', True) else '❌ Отключены'}\n\n"
                 "<i>Выберите действие:</i>"
             )
-            await event.message.answer(
-                welcome_text,
-                attachments=[self.get_main_keyboard(user_id)],
-                format=TextFormat.HTML
-            )
+            keyboard = self.get_main_keyboard(user_id)
         else:
             welcome_text = (
-                f"<b>ДОБРО ПОЖАЛОВАТЬ, {sender.first_name}!</b>\n\n"
+                f"<b>ДОБРО ПОЖАЛОВАТЬ, {first_name}!</b>\n\n"
                 "Я бот для управления графиком дежурств.\n\n"
             )
             if username:
                 welcome_text += f"Ваш username: @{username}\n"
             welcome_text += "<i>Пожалуйста, выберите ваше ФИО из списка:</i>"
+            keyboard = self.get_employee_selection_keyboard(prefix="emp_")
 
-            await event.message.answer(
-                welcome_text,
-                attachments=[self.get_employee_selection_keyboard(prefix="emp_")],
-                format=TextFormat.HTML
-            )
+        return welcome_text, keyboard
+
+    async def start(self, event: MessageCreated):
+        sender = event.message.sender
+        user_id = str(sender.user_id)
+        welcome_text, keyboard = self._register_user_and_build_welcome(
+            user_id, sender.username, sender.first_name, sender.last_name
+        )
+        await event.message.answer(welcome_text, attachments=[keyboard], format=TextFormat.HTML)
+
+    async def on_bot_started(self, event: BotStarted):
+        """Срабатывает, когда пользователь открывает чат с ботом впервые —
+        аналог 'кнопки меню': показываем меню сразу, без ожидания команды /start."""
+        user = event.user
+        user_id = str(user.user_id)
+        welcome_text, keyboard = self._register_user_and_build_welcome(
+            user_id, user.username, user.first_name, user.last_name
+        )
+        await self.bot.send_message(
+            user_id=user.user_id,
+            text=welcome_text,
+            attachments=[keyboard],
+            format=TextFormat.HTML
+        )
 
     async def admin_login(self, event: MessageCreated):
         sender = event.message.sender
