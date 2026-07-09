@@ -1785,7 +1785,18 @@ class DutyBot:
     async def on_document(self, event: MessageCreated):
         sender = event.message.sender
         user_id = str(sender.user_id) if sender else None
-        if not user_id or not self.is_admin(user_id) or not self.admin_sessions.get(user_id, {}).get("logged_in"):
+        if not user_id or not self.is_admin(user_id):
+            return  # обычный пользователь прислал файл — молча игнорируем, как и раньше
+
+        if not self.admin_sessions.get(user_id, {}).get("logged_in"):
+            # Админ-сессия хранится только в памяти процесса и слетает при каждом
+            # рестарте бота — раньше это приводило к полному молчанию без объяснений.
+            await event.message.answer(
+                "❌ <b>СЕССИЯ АДМИНИСТРАТОРА НЕ АКТИВНА</b>\n\n"
+                "Бот мог перезапуститься на хостинге — войдите заново:\n"
+                "<code>/admin логин пароль</code>",
+                format=TextFormat.HTML
+            )
             return
 
         body = event.message.body
@@ -1798,6 +1809,13 @@ class DutyBot:
         caption = (body.text or "").strip().lower()
 
         if caption not in ("протокол", "protocol", "закрепить", "pin", "прикрепить"):
+            await event.message.answer(
+                "ℹ️ <b>ФАЙЛ ПОЛУЧЕН, НО НЕ ОБРАБОТАН</b>\n\n"
+                "Чтобы бот сохранил файл — отправьте его ещё раз с подписью "
+                "<code>протокол</code> (сохранить) или <code>закрепить</code> "
+                "(закрепить в чате).",
+                format=TextFormat.HTML
+            )
             return
 
         if not filename.endswith(".docx"):
