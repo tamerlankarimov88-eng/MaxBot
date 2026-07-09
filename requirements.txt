@@ -1,0 +1,4 @@
+maxapi
+pytz
+apscheduler
+python-dotenv

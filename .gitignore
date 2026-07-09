@@ -1,0 +1,8 @@
+.env
+config.json
+__pycache__/
+*.pyc
+venv/
+.venv/
+downloads/
+user_data.json

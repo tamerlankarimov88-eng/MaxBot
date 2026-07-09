@@ -1,0 +1,14 @@
+{
+  "admin_login": "AdminDuty",
+  "admin_password": "замените_на_сложный_пароль",
+  "super_admin_username": "@ваш_username",
+  "username_to_employee": {
+    "@username1": "Фамилия И.О."
+  },
+  "employee_phones": {
+    "Фамилия И.О.": "8-000-000-00-00"
+  },
+  "duty_rotation_circle": [
+    "Фамилия И.О."
+  ]
+}
