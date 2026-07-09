@@ -52,16 +52,24 @@ logger = logging.getLogger(__name__)
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
 
 # Персональные данные (ФИО, телефоны, логин/пароль админки) НЕ хранятся в коде —
-# они читаются из config.json, который не должен попадать в git (см. .gitignore).
+# они читаются либо из config.json (локально/на VPS), либо из переменной
+# окружения CONFIG_JSON (на хостингах вроде Railway/Render/Fly, где нет
+# доступа к файловой системе репозитория, только env-переменные).
 # Шаблон структуры: config.example.json.
 CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 
 
 def _load_config() -> dict:
+    env_config = os.environ.get("CONFIG_JSON")
+    if env_config:
+        return json.loads(env_config)
+
     if not CONFIG_PATH.exists():
         raise FileNotFoundError(
-            f"Не найден {CONFIG_PATH}. Скопируйте config.example.json в config.json "
-            "и заполните реальными данными сотрудников — этот файл не должен попадать в git."
+            f"Не найден {CONFIG_PATH} и не задана переменная окружения CONFIG_JSON. "
+            "Локально: скопируйте config.example.json в config.json и заполните реальными "
+            "данными. На хостинге без файловой системы: положите содержимое config.json "
+            "целиком (в одну строку) в переменную окружения CONFIG_JSON."
         )
     with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
         return json.load(f)
