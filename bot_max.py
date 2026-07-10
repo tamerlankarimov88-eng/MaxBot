@@ -137,9 +137,18 @@ PROTOCOL_FILENAME_MASK = _config.get(
     "protocol_filename_mask", "Протокол Разногласий_{date}_Смена{shift_number}.docx"
 )
 
+# Реальный бланк протокола разногласий, который заполняется данными смены
+# (ТЗ п.2.5). Файл лежит рядом с bot_max.py и должен приезжать вместе с кодом.
+PROTOCOL_TEMPLATE_PATH = Path(__file__).resolve().parent / "protocol_template.docx"
+
+RU_MONTHS_GENITIVE = {
+    1: "января", 2: "февраля", 3: "марта", 4: "апреля", 5: "мая", 6: "июня",
+    7: "июля", 8: "августа", 9: "сентября", 10: "октября", 11: "ноября", 12: "декабря",
+}
+
 # Обновляется вручную при каждом релизе — по /time можно однозначно проверить,
 # какая версия кода реально работает на хостинге (без гадания по редеплою).
-BOT_CODE_VERSION = "2026-07-10-clear-stale-keyboards"
+BOT_CODE_VERSION = "2026-07-10-real-protocol-template"
 
 
 class DutyScheduleGenerator:
@@ -827,6 +836,54 @@ class DutyBot:
 
         await self._finalize_shift_protocol(shift, event.message.recipient.chat_id)
 
+    def _fill_protocol_template(self, shift: Dict, file_path: Path):
+        """Заполняет реальный бланк protocol_template.docx (тот, что использует
+        компания при дежурствах) данными смены — вместо генерации файла с нуля.
+
+        Что подставляется:
+        - дата в формате «ДД» месяц ГГГГг. (как в оригинальном бланке)
+        - в шапку таблицы («Сторона 1»/«Сторона 2») — реальные дежурные
+        - строки таблицы («Наименование») — по одной на каждый вопрос опроса,
+          с общим ответом в обеих колонках (опрос общий, не по каждой стороне отдельно)
+        Блок подписей внизу НЕ трогается — это бланк для ручной подписи после печати."""
+        doc = Document(str(PROTOCOL_TEMPLATE_PATH))
+
+        day, month, year_g = shift["date"].replace("г.", "").split(".")
+        date_para = doc.paragraphs[3]
+        date_para.runs[2].text = day
+        date_para.runs[4].text = RU_MONTHS_GENITIVE.get(int(month), month)
+        date_para.runs[6].text = f"{year_g}г."
+
+        table = doc.tables[0]
+        employees = shift["employees"]
+        for i in range(2):
+            cell = table.rows[0].cells[i + 1]
+            emp = employees[i] if i < len(employees) else None
+            cell.paragraphs[0].runs[2].text = "Должность: Дежурный" if emp else "—"
+            cell.paragraphs[1].runs[0].text = emp if emp else "—"
+
+        survey = shift.get("survey", {})
+        questions = [
+            ("Как прошло дежурство?", survey.get("quality", "—")),
+            ("Были ли инциденты?", survey.get("incidents", "—")),
+            ("Были ли ЗГД?", survey.get("zgd", "—")),
+        ]
+        row1 = table.rows[1]
+        row1.cells[0].paragraphs[0].add_run(questions[0][0])
+        row1.cells[1].paragraphs[0].runs[0].text = questions[0][1]
+        row1.cells[2].paragraphs[0].runs[0].text = questions[0][1]
+        for q_text, answer in questions[1:]:
+            new_row = table.add_row()
+            new_row.cells[0].paragraphs[0].add_run(q_text)
+            new_row.cells[1].paragraphs[0].add_run(answer)
+            new_row.cells[2].paragraphs[0].add_run(answer)
+
+        remarks = survey.get("remarks")
+        if remarks:
+            doc.add_paragraph(f"Замечания: {remarks}")
+
+        doc.save(str(file_path))
+
     async def _finalize_shift_protocol(self, shift: Dict, chat_id: Optional[int]):
         """Генерирует .docx протокол по итогам смены и закрепляет его в чате (ТЗ п.2.5)."""
         try:
@@ -835,18 +892,7 @@ class DutyBot:
             self.protocol_dir.mkdir(exist_ok=True)
             file_path = self.protocol_dir / filename
 
-            doc = Document()
-            doc.add_heading("Протокол разногласий", level=1)
-            doc.add_paragraph(f"Дата дежурства: {shift['date']}")
-            doc.add_paragraph(f"Смена №{shift['shift_number']}")
-            doc.add_paragraph(f"Дежурили: {', '.join(shift['employees'])}")
-            doc.add_heading("Итоги опроса", level=2)
-            survey = shift.get("survey", {})
-            doc.add_paragraph(f"Как прошло дежурство: {survey.get('quality', '—')}")
-            doc.add_paragraph(f"Инциденты: {survey.get('incidents', '—')}")
-            doc.add_paragraph(f"ЗГД: {survey.get('zgd', '—')}")
-            doc.add_paragraph(f"Замечания: {survey.get('remarks') or '—'}")
-            doc.save(str(file_path))
+            self._fill_protocol_template(shift, file_path)
 
             shift["protocol_file"] = str(file_path)
             self.save_shifts()
