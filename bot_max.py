@@ -139,7 +139,7 @@ PROTOCOL_FILENAME_MASK = _config.get(
 
 # Обновляется вручную при каждом релизе — по /time можно однозначно проверить,
 # какая версия кода реально работает на хостинге (без гадания по редеплою).
-BOT_CODE_VERSION = "2026-07-10-no-username-gates"
+BOT_CODE_VERSION = "2026-07-10-survey-error-handling"
 
 
 class DutyScheduleGenerator:
@@ -744,44 +744,61 @@ class DutyBot:
             _, shift_number_str, question_key, option_index_str = payload.split("|")
             shift_number = int(shift_number_str)
             option_index = int(option_index_str)
-        except (ValueError, AttributeError):
+        except (ValueError, AttributeError) as e:
+            logger.error(f"Некорректный payload опроса '{payload}': {e}")
+            if event.message is not None:
+                await event.message.answer("❌ Не удалось обработать кнопку опроса.", format=TextFormat.HTML)
             return
 
-        shift = self._get_shift(shift_number)
-        if not shift or event.message is None:
+        if event.message is None:
             return
 
-        question = SURVEY_CONFIG["questions"][question_key]
-        answer_text = question["options"][option_index]
-        shift["survey"][question_key] = answer_text
-        self.save_shifts()
+        try:
+            shift = self._get_shift(shift_number)
+            if not shift:
+                logger.error(f"Опрос: смена №{shift_number} не найдена в shifts_history.json (всего смен: {len(self.shifts)})")
+                await event.message.answer(
+                    "❌ <b>Не удалось сохранить ответ</b>\n\nЭта смена больше не найдена в базе бота "
+                    "(вероятно, бот перезапускался и потерял данные). Запустите опрос заново через "
+                    "<code>/test_survey</code> или дождитесь субботы.",
+                    format=TextFormat.HTML
+                )
+                return
 
-        responder = event.callback.user
-        audit(str(responder.user_id), responder.username, "survey_answer",
-              f"смена №{shift_number}, {question_key}={answer_text}")
+            question = SURVEY_CONFIG["questions"][question_key]
+            answer_text = question["options"][option_index]
+            shift["survey"][question_key] = answer_text
+            self.save_shifts()
 
-        order = ["quality", "incidents", "zgd"]
-        next_index = order.index(question_key) + 1 if question_key in order else len(order)
+            responder = event.callback.user
+            audit(str(responder.user_id), responder.username, "survey_answer",
+                  f"смена №{shift_number}, {question_key}={answer_text}")
 
-        if next_index < len(order):
-            next_key = order[next_index]
-            next_question = SURVEY_CONFIG["questions"][next_key]
-            kb = InlineKeyboardBuilder()
-            for i, option in enumerate(next_question["options"]):
-                kb.row(CallbackButton(text=option, payload=f"survey|{shift_number}|{next_key}|{i}"))
-            await event.message.edit(
-                text=f"✅ Ответ сохранён: <b>{answer_text}</b>\n\n{next_question['text']}",
-                attachments=[kb.as_markup()],
-                format=TextFormat.HTML
-            )
-        else:
-            await event.message.edit(
-                text=f"✅ Ответ сохранён: <b>{answer_text}</b>\n\n"
-                     f"📝 Последний шаг — напишите замечания текстом (или отправьте <code>-</code>, если их нет):",
-                format=TextFormat.HTML
-            )
-            await context.update_data(survey_shift_number=shift_number)
-            await context.set_state(SurveyWizard.awaiting_remarks)
+            order = ["quality", "incidents", "zgd"]
+            next_index = order.index(question_key) + 1 if question_key in order else len(order)
+
+            if next_index < len(order):
+                next_key = order[next_index]
+                next_question = SURVEY_CONFIG["questions"][next_key]
+                kb = InlineKeyboardBuilder()
+                for i, option in enumerate(next_question["options"]):
+                    kb.row(CallbackButton(text=option, payload=f"survey|{shift_number}|{next_key}|{i}"))
+                await event.message.edit(
+                    text=f"✅ Ответ сохранён: <b>{answer_text}</b>\n\n{next_question['text']}",
+                    attachments=[kb.as_markup()],
+                    format=TextFormat.HTML
+                )
+            else:
+                await event.message.edit(
+                    text=f"✅ Ответ сохранён: <b>{answer_text}</b>\n\n"
+                         f"📝 Последний шаг — напишите замечания текстом (или отправьте <code>-</code>, если их нет):",
+                    format=TextFormat.HTML
+                )
+                await context.update_data(survey_shift_number=shift_number)
+                await context.set_state(SurveyWizard.awaiting_remarks)
+        except Exception as e:
+            logger.error(f"Ошибка обработки ответа на опрос (payload={payload}): {e}")
+            await event.message.answer(f"❌ Ошибка сохранения ответа: {str(e)[:200]}", format=TextFormat.HTML)
 
     async def wizard_survey_remarks(self, event: MessageCreated, context: BaseContext):
         data = await context.get_data()
