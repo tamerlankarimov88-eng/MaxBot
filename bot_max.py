@@ -393,7 +393,6 @@ class DutyBot:
         self.protocol_pinned_message_id = None
         self.download_dir = Path("downloads")
         self.protocol_dir = Path("protocols")
-        self.admin_sessions = {}
         self.scheduler = None
         self.load_user_data()
         self.load_shifts()
@@ -947,13 +946,17 @@ class DutyBot:
     def is_authorized_admin(self, user_id: str) -> bool:
         """Полная проверка админ-доступа (ТЗ п.3, «Безопасность»): либо
         user_id есть в ADMIN_IDS из конфига (доступ без /admin login),
-        либо пользователь вошёл обычным логином/паролем в этом сеансе."""
+        либо пользователь вошёл обычным логином/паролем.
+
+        Статус входа хранится в user_data.json (persisted), а не только в
+        памяти — иначе он слетал бы при каждом рестарте/redeploy бота на
+        хостинге, вынуждая логиниться заново после буквально любого деплоя."""
         try:
             if int(user_id) in ADMIN_IDS:
                 return True
         except ValueError:
             pass
-        return self.is_admin(user_id) and self.admin_sessions.get(user_id, {}).get("logged_in", False)
+        return self.is_admin(user_id) and self.user_data.get(user_id, {}).get("admin_logged_in", False)
 
     def is_whitelisted(self, user_id: str) -> bool:
         """Защита от посторонних (ТЗ п.2.4). Если WHITELIST_MODE выключен в
@@ -1198,14 +1201,22 @@ class DutyBot:
         login, password = args[0], args[1]
 
         if login == ADMIN_CREDENTIALS["login"] and password == ADMIN_CREDENTIALS["password"]:
-            if user_id in self.user_data:
-                self.user_data[user_id]["is_admin"] = True
-                self.save_user_data()
+            if user_id not in self.user_data:
+                # Логин без предварительного /start — заводим карточку пользователя,
+                # иначе is_admin/admin_logged_in было бы некуда сохранить.
+                self.user_data[user_id] = {
+                    "username": sender.username, "first_name": sender.first_name,
+                    "last_name": sender.last_name,
+                    "display_name": f"{sender.first_name or ''} {sender.last_name or ''}".strip(),
+                    "notifications": True, "selected_employee": None,
+                    "registered_at": datetime.now().isoformat(),
+                    "last_active": datetime.now().isoformat(), "is_admin": False,
+                }
 
-            self.admin_sessions[user_id] = {
-                "logged_in": True,
-                "login_time": datetime.now().isoformat()
-            }
+            self.user_data[user_id]["is_admin"] = True
+            self.user_data[user_id]["admin_logged_in"] = True
+            self.user_data[user_id]["admin_login_time"] = datetime.now().isoformat()
+            self.save_user_data()
             audit(user_id, sender.username, "admin_login_success")
 
             await event.message.answer(
@@ -1951,11 +1962,9 @@ class DutyBot:
         await message.edit(text=text, attachments=[self.get_admin_keyboard()], format=TextFormat.HTML)
 
     async def admin_logout(self, message, user_id, context=None):
-        if user_id in self.admin_sessions:
-            del self.admin_sessions[user_id]
-
         if user_id in self.user_data:
             self.user_data[user_id]["is_admin"] = False
+            self.user_data[user_id]["admin_logged_in"] = False
             self.save_user_data()
 
         await message.edit(
