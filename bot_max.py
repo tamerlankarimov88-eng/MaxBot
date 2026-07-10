@@ -140,6 +140,10 @@ PROTOCOL_FILENAME_MASK = _config.get(
     "protocol_filename_mask", "Протокол Разногласий_{date}_Смена{shift_number}.docx"
 )
 
+# Обновляется вручную при каждом релизе — по /time можно однозначно проверить,
+# какая версия кода реально работает на хостинге (без гадания по редеплою).
+BOT_CODE_VERSION = "2026-07-10-super-admin-fix"
+
 
 class DutyScheduleGenerator:
     """Генератор графика дежурств с поддержкой полного цикла из 12 недель.
@@ -1241,9 +1245,9 @@ class DutyBot:
 
     async def check_users_status(self, event: MessageCreated):
         sender = event.message.sender
-        if not self.is_super_admin(sender.username):
+        if not (self.is_super_admin(sender.username) or self.is_authorized_admin(str(sender.user_id))):
             await event.message.answer(
-                f"❌ <b>ДОСТУП ЗАПРЕЩЕН</b>\n\nЭта команда доступна только {SUPER_ADMIN_USERNAME}",
+                f"❌ <b>ДОСТУП ЗАПРЕЩЕН</b>\n\nЭта команда доступна {SUPER_ADMIN_USERNAME} или админам, вошедшим через /admin",
                 format=TextFormat.HTML
             )
             return
@@ -1278,7 +1282,7 @@ class DutyBot:
 
     async def enable_notifications_all(self, event: MessageCreated):
         sender = event.message.sender
-        if not self.is_super_admin(sender.username):
+        if not (self.is_super_admin(sender.username) or self.is_authorized_admin(str(sender.user_id))):
             return
 
         self.load_user_data()
@@ -1295,7 +1299,7 @@ class DutyBot:
 
     async def test_send_to_user(self, event: MessageCreated):
         sender = event.message.sender
-        if not self.is_super_admin(sender.username):
+        if not (self.is_super_admin(sender.username) or self.is_authorized_admin(str(sender.user_id))):
             return
 
         args = self._parse_args(event)
@@ -1335,7 +1339,7 @@ class DutyBot:
 
     async def check_time(self, event: MessageCreated):
         sender = event.message.sender
-        if not self.is_super_admin(sender.username):
+        if not (self.is_super_admin(sender.username) or self.is_authorized_admin(str(sender.user_id))):
             return
 
         now = datetime.now(MOSCOW_TZ)
@@ -1360,13 +1364,14 @@ class DutyBot:
 
         await event.message.answer(
             f"🕐 <b>ИНФОРМАЦИЯ О ВРЕМЕНИ</b>\n\n📅 Дата: {now.strftime('%d.%m.%Y')}\n⏰ Время: {now.strftime('%H:%M:%S')}\n📆 День недели: {weekday_ru}\n🌍 Часовой пояс: Москва (UTC+3)\n\n"
-            f"🔄 <b>Следующее уведомление:</b> {next_notification}\n\n📋 <b>Расписание:</b>\n• Среда 18:00 - всем\n• Пятница 18:00 - всем\n• Суббота 10:00 - всем",
+            f"🔄 <b>Следующее уведомление:</b> {next_notification}\n\n📋 <b>Расписание:</b>\n• Среда 18:00 - всем\n• Пятница 18:00 - всем\n• Суббота 10:00 - всем\n\n"
+            f"<i>Версия кода: {BOT_CODE_VERSION}</i>",
             format=TextFormat.HTML
         )
 
     async def fix_all_users(self, event: MessageCreated):
         sender = event.message.sender
-        if not self.is_super_admin(sender.username):
+        if not (self.is_super_admin(sender.username) or self.is_authorized_admin(str(sender.user_id))):
             return
 
         self.load_user_data()
@@ -2497,8 +2502,6 @@ class DutyBot:
             return  # обычный пользователь прислал файл — молча игнорируем
 
         if not self.is_authorized_admin(user_id):
-            # Админ-сессия хранится только в памяти процесса и слетает при каждом
-            # рестарте бота — раньше это приводило к полному молчанию без объяснений.
             await event.message.answer(
                 "❌ <b>СЕССИЯ АДМИНИСТРАТОРА НЕ АКТИВНА</b>\n\n"
                 "Бот мог перезапуститься на хостинге — войдите заново:\n"
