@@ -157,7 +157,7 @@ RU_MONTHS_GENITIVE = {
 
 # Обновляется вручную при каждом релизе — по /time можно однозначно проверить,
 # какая версия кода реально работает на хостинге (без гадания по редеплою).
-BOT_CODE_VERSION = "2026-07-10-persist-schedule-overrides"
+BOT_CODE_VERSION = "2026-07-10-test-protocol-command"
 
 
 class DutyScheduleGenerator:
@@ -495,6 +495,7 @@ class DutyBot:
         dp.message_created(Command("set_phone"))(self.cmd_set_phone)
         dp.message_created(Command("set_schedule"))(self.cmd_set_schedule)
         dp.message_created(Command("myid"))(self.cmd_myid)
+        dp.message_created(Command("test_protocol"))(self.send_test_protocol)
 
         dp.message_callback()(self.on_callback)
 
@@ -1539,6 +1540,35 @@ class DutyBot:
             text = "⚠️ Опрос создан, но <b>не ушёл ни одному получателю</b>.\n\n" + text
 
         await event.message.answer(text, format=TextFormat.HTML)
+
+    async def send_test_protocol(self, event: MessageCreated):
+        """/test_protocol — сразу генерирует и присылает .docx протокол, без
+        прохождения всего опроса. Только для быстрой проверки формата файла —
+        в shifts_history.json эта тестовая смена НЕ сохраняется."""
+        user_id = str(event.message.sender.user_id)
+        if not self.is_admin(user_id):
+            return
+
+        duty_today = self.schedule_generator.get_todays_duty()
+        if not duty_today:
+            current_schedule = self.schedule_generator._generate_dynamic_schedule()
+            if current_schedule:
+                duty_today = min(current_schedule.values(), key=lambda d: d["date_obj"])
+        if not duty_today:
+            await event.message.answer("❌ Нет данных о дежурствах для теста.", format=TextFormat.HTML)
+            return
+
+        test_shift = {
+            "shift_number": 0,
+            "date": duty_today["date_obj"].strftime("%d.%m.%Yг."),
+            "employees": duty_today["employees"],
+            "survey": {"quality": "Отлично", "incidents": "Нет", "zgd": "Нет", "remarks": ""},
+            "protocol_file": None,
+            "completed": True,
+        }
+
+        await event.message.answer("🔄 Генерирую тестовый протокол...")
+        await self._finalize_shift_protocol(test_shift, event.message.recipient.chat_id)
 
     async def test_notification_for_user(self, event: MessageCreated):
         user_id = str(event.message.sender.user_id)
