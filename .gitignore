@@ -8,4 +8,5 @@ downloads/
 protocols/
 user_data.json
 shifts_history.json
+duty_schedule.json
 audit.log

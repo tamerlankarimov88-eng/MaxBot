@@ -109,7 +109,16 @@ EMPLOYEE_PHONES = _config["employee_phones"]
 DUTY_ROTATION_CIRCLE = _config["duty_rotation_circle"]
 
 # Исходный базовый список для хранения ручных правок админов
-DUTY_SCHEDULE = []
+DUTY_SCHEDULE = [
+    {
+        "date": "11.07.2026г.", "date_obj": datetime(2026, 7, 11),
+        "employees": ["Лызина С.В."], "phones": ["8-919-635-55-06"], "is_pair": False,
+    },
+    {
+        "date": "18.07.2026г.", "date_obj": datetime(2026, 7, 18),
+        "employees": ["Коробова И.А."], "phones": ["8-917-858-22-50"], "is_pair": False,
+    },
+]
 
 # user_id администраторов, которым при первом запуске бота автоматически
 # выдаются права админа (ТЗ п.3, "Безопасность": проверка по списку ADMIN_IDS).
@@ -148,7 +157,7 @@ RU_MONTHS_GENITIVE = {
 
 # Обновляется вручную при каждом релизе — по /time можно однозначно проверить,
 # какая версия кода реально работает на хостинге (без гадания по редеплою).
-BOT_CODE_VERSION = "2026-07-10-clear-example-row"
+BOT_CODE_VERSION = "2026-07-10-persist-schedule-overrides"
 
 
 class DutyScheduleGenerator:
@@ -157,10 +166,41 @@ class DutyScheduleGenerator:
     Не зависит от мессенджера — перенесено без изменений.
     """
 
+    OVERRIDES_FILE = "duty_schedule.json"
+
     def __init__(self, schedule_data: List[Dict]):
         self.schedule_data = schedule_data
         self.schedule = {}
+        self._load_overrides()
         self.initialize_schedule()
+
+    def _load_overrides(self):
+        """Подгружает ручные правки графика, сохранённые предыдущим запуском —
+        без этого любой рестарт бота стирал все дежурства, добавленные вручную
+        через админку (они хранились только в памяти процесса)."""
+        if not os.path.exists(self.OVERRIDES_FILE):
+            return
+        try:
+            with open(self.OVERRIDES_FILE, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+            for item in raw:
+                item["date_obj"] = datetime.fromisoformat(item["date_obj"])
+                self.schedule_data.append(item)
+            logger.info(f"Загружено {len(raw)} ручных правок графика из {self.OVERRIDES_FILE}")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки {self.OVERRIDES_FILE}: {e}")
+
+    def _save_overrides(self):
+        try:
+            serializable = []
+            for item in self.schedule_data:
+                copy_item = dict(item)
+                copy_item["date_obj"] = item["date_obj"].isoformat()
+                serializable.append(copy_item)
+            with open(self.OVERRIDES_FILE, 'w', encoding='utf-8') as f:
+                json.dump(serializable, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Ошибка сохранения {self.OVERRIDES_FILE}: {e}")
 
     def initialize_schedule(self):
         for duty in self.schedule_data:
@@ -331,6 +371,7 @@ class DutyScheduleGenerator:
                 "is_pair": is_pair
             })
 
+            self._save_overrides()
             logger.info(f"Добавлено ручное дежурство: {date_str} - {employees}")
             return True, "Дежурство успешно добавлено"
         except Exception as e:
@@ -343,6 +384,7 @@ class DutyScheduleGenerator:
         if date_str in self.schedule:
             del self.schedule[date_str]
             self.schedule_data = [d for d in self.schedule_data if d["date"] != date_str]
+            self._save_overrides()
             logger.info(f"Удалено ручное дежурство: {date_str}")
             return True
         return False
