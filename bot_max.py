@@ -139,7 +139,7 @@ PROTOCOL_FILENAME_MASK = _config.get(
 
 # Обновляется вручную при каждом релизе — по /time можно однозначно проверить,
 # какая версия кода реально работает на хостинге (без гадания по редеплою).
-BOT_CODE_VERSION = "2026-07-10-survey-error-handling"
+BOT_CODE_VERSION = "2026-07-10-clear-stale-keyboards"
 
 
 class DutyScheduleGenerator:
@@ -792,6 +792,8 @@ class DutyBot:
                 await event.message.edit(
                     text=f"✅ Ответ сохранён: <b>{answer_text}</b>\n\n"
                          f"📝 Последний шаг — напишите замечания текстом (или отправьте <code>-</code>, если их нет):",
+                    attachments=[],  # явно убираем кнопки Да/Нет — иначе message.edit() без attachments
+                                     # оставляет предыдущую клавиатуру видимой (она уже ни на что не влияет)
                     format=TextFormat.HTML
                 )
                 await context.update_data(survey_shift_number=shift_number)
@@ -1853,12 +1855,12 @@ class DutyBot:
             target_info["whitelisted"] = True
             target_info["access_request_status"] = "approved"
             self.save_user_data()
-            await message.edit(text=f"✅ Доступ разрешён для {target_name}.", format=TextFormat.HTML)
+            await message.edit(text=f"✅ Доступ разрешён для {target_name}.", attachments=[], format=TextFormat.HTML)
             notify_text = "✅ Ваш доступ к боту подтверждён администратором! Напишите /start."
         else:
             target_info["access_request_status"] = "denied"
             self.save_user_data()
-            await message.edit(text=f"❌ Доступ отклонён для {target_name}.", format=TextFormat.HTML)
+            await message.edit(text=f"❌ Доступ отклонён для {target_name}.", attachments=[], format=TextFormat.HTML)
             notify_text = "❌ Ваш запрос на доступ к боту отклонён администратором."
 
         try:
