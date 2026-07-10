@@ -148,7 +148,7 @@ RU_MONTHS_GENITIVE = {
 
 # Обновляется вручную при каждом релизе — по /time можно однозначно проверить,
 # какая версия кода реально работает на хостинге (без гадания по редеплою).
-BOT_CODE_VERSION = "2026-07-10-protocol-date-and-fio"
+BOT_CODE_VERSION = "2026-07-10-clear-example-row"
 
 
 class DutyScheduleGenerator:
@@ -853,6 +853,13 @@ class DutyBot:
         for i, emp in enumerate(employees[:2]):
             fio_cell = table.rows[0].cells[i + 1]
             fio_cell.paragraphs[1].runs[0].text = emp
+
+        # Строка "Да"/"Нет" в шаблоне — это просто пример заполнения, не реальные
+        # данные. Очищаем её текст, оставляя саму строку таблицы (с рамками) пустой.
+        for cell in table.rows[1].cells:
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.text = ""
 
         doc.save(str(file_path))
 
