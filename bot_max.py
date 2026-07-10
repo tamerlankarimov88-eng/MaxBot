@@ -652,17 +652,21 @@ class DutyBot:
     def _get_shift(self, shift_number: int) -> Optional[Dict]:
         return next((s for s in self.shifts if s.get("shift_number") == shift_number), None)
 
-    async def send_shift_survey(self, force: bool = False):
+    async def send_shift_survey(self, force: bool = False) -> Dict:
         """Опрос по итогам дежурства (ТЗ п.2.2) — отправляется дежурному(ым) в
         SURVEY_CONFIG['send_hour']:SURVEY_CONFIG['send_minute'] по субботам.
 
         force=True (команда /test_survey) снимает проверку дня недели и
-        повторной отправки — удобно для ручного тестирования в любой день."""
+        повторной отправки — удобно для ручного тестирования в любой день.
+
+        Возвращает словарь {ok, sent, employees, reason} — используется
+        /test_survey, чтобы явно показать, ушёл ли опрос кому-то реально,
+        а не просто молча отчитаться об «успехе»."""
         try:
             today = datetime.now(MOSCOW_TZ).replace(tzinfo=None)
             if today.weekday() != 5 and not force:
                 logger.warning(f"send_shift_survey вызван не в субботу! День недели: {today.weekday()}")
-                return
+                return {"ok": False, "sent": 0, "employees": [], "reason": "не суббота"}
 
             duty_today = self.schedule_generator.get_todays_duty()
             if not duty_today and force:
@@ -672,12 +676,12 @@ class DutyBot:
                     duty_today = min(current_schedule.values(), key=lambda d: d["date_obj"])
             if not duty_today:
                 logger.info("Опрос по дежурству: дежурных нет, опрос не отправляется")
-                return
+                return {"ok": False, "sent": 0, "employees": [], "reason": "нет дежурных в графике"}
 
             date_str = today.strftime("%d.%m.%Yг.")
             if any(s["date"] == date_str for s in self.shifts) and not force:
                 logger.info(f"Опрос по смене {date_str} уже отправлялся, повторно не отправляем")
-                return
+                return {"ok": False, "sent": 0, "employees": [], "reason": "опрос по этой смене уже отправлялся"}
 
             shift_number = len(self.shifts) + 1
             shift = {
@@ -697,8 +701,12 @@ class DutyBot:
                 kb.row(CallbackButton(text=option, payload=f"survey|{shift_number}|quality|{i}"))
 
             sent_to = 0
+            unlinked_employees = []
             for emp in duty_today["employees"]:
-                for uid in self._get_user_ids_for_employee(emp):
+                recipients = self._get_user_ids_for_employee(emp)
+                if not recipients:
+                    unlinked_employees.append(emp)
+                for uid in recipients:
                     try:
                         await self.bot.send_message(
                             user_id=int(uid),
@@ -710,10 +718,21 @@ class DutyBot:
                     except Exception as e:
                         logger.error(f"Не удалось отправить опрос пользователю {uid}: {e}")
 
+            if unlinked_employees:
+                logger.warning(
+                    f"Опрос по смене №{shift_number}: сотрудники без привязанного "
+                    f"пользователя бота — {', '.join(unlinked_employees)}"
+                )
+
             logger.info(f"Опрос по смене №{shift_number} ({date_str}) отправлен {sent_to} получателям")
             audit("system", None, "survey_sent", f"смена №{shift_number}, {date_str}, получателей: {sent_to}")
+            return {
+                "ok": True, "sent": sent_to, "employees": duty_today["employees"],
+                "unlinked": unlinked_employees, "shift_number": shift_number,
+            }
         except Exception as e:
             logger.error(f"Ошибка отправки опроса по дежурству: {e}")
+            return {"ok": False, "sent": 0, "employees": [], "reason": str(e)}
 
     async def handle_survey_callback(self, event: MessageCallback, context: BaseContext):
         """Обработка нажатий кнопок опроса: payload вида survey|{смена}|{вопрос}|{индекс}.
@@ -1409,8 +1428,24 @@ class DutyBot:
         if not self.is_admin(user_id):
             return
         await event.message.answer("🔄 Отправляю тестовый опрос по итогам дежурства...")
-        await self.send_shift_survey(force=True)
-        await event.message.answer("✅ Тестовый опрос отправлен (дежурному(ым) в личные сообщения)!")
+        result = await self.send_shift_survey(force=True)
+
+        if not result["ok"]:
+            await event.message.answer(f"❌ Опрос не отправлен: {result['reason']}", format=TextFormat.HTML)
+            return
+
+        text = f"Дежурные по графику: {', '.join(result['employees'])}\n📤 Реально получили опрос: {result['sent']}"
+        if result.get("unlinked"):
+            text += (
+                f"\n\n⚠️ <b>Не привязаны ни к одному пользователю бота:</b> "
+                f"{', '.join(result['unlinked'])}\n"
+                f"Опрос им отправить некуда — сотрудник должен сначала написать /start "
+                f"и выбрать своё ФИО в меню."
+            )
+        if result["sent"] == 0:
+            text = "⚠️ Опрос создан, но <b>не ушёл ни одному получателю</b>.\n\n" + text
+
+        await event.message.answer(text, format=TextFormat.HTML)
 
     async def test_notification_for_user(self, event: MessageCreated):
         user_id = str(event.message.sender.user_id)
@@ -1691,22 +1726,43 @@ class DutyBot:
         await event.message.answer(text, format=TextFormat.HTML)
 
     async def cmd_set_phone(self, event: MessageCreated):
-        """Команда /set_phone — алиас кнопки «Изменить телефон» (только для админов из ADMIN_IDS/логина)."""
+        """Команда /set_phone — алиас кнопки «Изменить телефон» (только для админов из ADMIN_IDS/логина).
+
+        ВАЖНО: не переиспользует admin_edit_phone() напрямую — тот вызывает
+        message.edit(), а бот не может редактировать чужое (не своё) сообщение,
+        которым здесь как раз является входящая команда /set_phone."""
         user_id = str(event.message.sender.user_id)
         if not self.is_authorized_admin(user_id):
             await event.message.answer("❌ Команда доступна только администраторам.", format=TextFormat.HTML)
             return
-        await self.admin_edit_phone(event.message, user_id, self.dp.fsm.get_context(
-            chat_id=event.message.recipient.chat_id, user_id=int(user_id)))
+
+        employees_list = "\n".join([f"• {emp}" for emp in EMPLOYEE_PHONES.keys()])
+        text = (
+            "📞 <b>ИЗМЕНЕНИЕ ТЕЛЕФОНА СОТРУДНИКА</b>\n\n"
+            f"<b>Список сотрудников:</b>\n{employees_list}\n\n"
+            "<i>Для изменения телефона отправьте сообщение в формате:</i>\n\n"
+            "<code>ФИО;новый телефон</code>\n\n"
+            "<b>Пример:</b>\n<code>Иванов И.И.;8-900-000-00-00</code>"
+        )
+        await event.message.answer(text, format=TextFormat.HTML)
+        context = self.dp.fsm.get_context(chat_id=event.message.recipient.chat_id, user_id=int(user_id))
+        await context.set_state(AdminWizard.awaiting_phone_edit)
 
     async def cmd_set_schedule(self, event: MessageCreated):
-        """Команда /set_schedule — алиас кнопки «Управление графиком» (только для админов)."""
+        """Команда /set_schedule — алиас кнопки «Управление графиком» (только для админов).
+
+        По той же причине, что и cmd_set_phone, не вызывает show_admin_schedule()
+        напрямую (там message.edit()) — вместо этого просто отправляет меню новым сообщением."""
         user_id = str(event.message.sender.user_id)
         if not self.is_authorized_admin(user_id):
             await event.message.answer("❌ Команда доступна только администраторам.", format=TextFormat.HTML)
             return
-        await self.show_admin_schedule(event.message, user_id, self.dp.fsm.get_context(
-            chat_id=event.message.recipient.chat_id, user_id=int(user_id)))
+
+        text = (
+            "📅 <b>УПРАВЛЕНИЕ ГРАФИКОМ ДЕЖУРСТВ</b>\n\n"
+            "➕ Добавить дежурство / ➖ Удалить дежурство / 📋 Просмотреть график:"
+        )
+        await event.message.answer(text, attachments=[self.get_schedule_admin_keyboard()], format=TextFormat.HTML)
 
     # ================= ЗАЩИТА ОТ ПОСТОРОННИХ (ТЗ п.2.4) =================
 
