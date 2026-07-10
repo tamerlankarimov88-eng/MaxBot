@@ -158,7 +158,7 @@ RU_MONTHS_GENITIVE = {
 
 # Обновляется вручную при каждом релизе — по /time можно однозначно проверить,
 # какая версия кода реально работает на хостинге (без гадания по редеплою).
-BOT_CODE_VERSION = "2026-07-10-photo-reports"
+BOT_CODE_VERSION = "2026-07-10-report-dedup-deadline"
 
 
 class DutyScheduleGenerator:
@@ -754,20 +754,34 @@ class DutyBot:
                 return {"ok": False, "sent": 0, "employees": [], "reason": "нет дежурных в графике"}
 
             date_str = today.strftime("%d.%m.%Yг.") if not force else duty_today["date_obj"].strftime("%d.%m.%Yг.")
-            if any(s["date"] == date_str for s in self.shifts) and not force:
+
+            # Одна смена — одна запись. Если запрос по этой дате уже создавался
+            # (в т.ч. предыдущим /test_report), переиспользуем ту же запись вместо
+            # создания дубля — иначе в "Список дежурств" копится несколько строк
+            # на одну и ту же дату, часть из которых навсегда виснет как "не отправил".
+            existing = next((s for s in self.shifts if s["date"] == date_str), None)
+            if existing and not force:
                 logger.info(f"Запрос фотоотчёта по смене {date_str} уже отправлялся, повторно не отправляем")
                 return {"ok": False, "sent": 0, "employees": [], "reason": "запрос по этой смене уже отправлялся"}
 
-            shift_number = len(self.shifts) + 1
-            shift = {
-                "shift_number": shift_number,
-                "date": date_str,
-                "employees": duty_today["employees"],
-                "photo_submitted": False,
-                "photo_path": None,
-                "completed": False,
-            }
-            self.shifts.append(shift)
+            if existing:
+                shift = existing
+                shift["employees"] = duty_today["employees"]
+                shift["photo_submitted"] = False
+                shift["photo_path"] = None
+                shift["completed"] = False
+                shift_number = shift["shift_number"]
+            else:
+                shift_number = len(self.shifts) + 1
+                shift = {
+                    "shift_number": shift_number,
+                    "date": date_str,
+                    "employees": duty_today["employees"],
+                    "photo_submitted": False,
+                    "photo_path": None,
+                    "completed": False,
+                }
+                self.shifts.append(shift)
             self.save_shifts()
 
             sent_to = 0
@@ -781,7 +795,9 @@ class DutyBot:
                         sent = await self.bot.send_message(
                             user_id=int(uid),
                             text="🔔 <b>ФОТООТЧЁТ О ДЕЖУРСТВЕ</b>\n\n"
-                                 "Пришлите, пожалуйста, фото протокола дежурства следующим сообщением.",
+                                 "Пришлите, пожалуйста, фото протокола дежурства следующим сообщением.\n\n"
+                                 "⏰ Жду фотоотчёт до <b>10:00</b> — после этого времени дежурство "
+                                 "будет зачтено как неподтверждённое.",
                             format=TextFormat.HTML
                         )
                         # На случай, если chat_id для личной переписки не совпадает с user_id —
@@ -824,6 +840,16 @@ class DutyBot:
         if not shift:
             await context.clear()
             await event.message.answer("❌ Не удалось найти смену для этого фотоотчёта.", format=TextFormat.HTML)
+            return
+
+        deadline = MOSCOW_TZ.localize(self._parse_shift_date(shift["date"]).replace(hour=10, minute=0, second=0))
+        if datetime.now(MOSCOW_TZ) > deadline:
+            await context.clear()
+            await event.message.answer(
+                "⏰ <b>Время приёма фотоотчёта истекло</b> (до 10:00).\n\n"
+                "Дежурство зачтено как неподтверждённое.",
+                format=TextFormat.HTML
+            )
             return
 
         body = event.message.body
