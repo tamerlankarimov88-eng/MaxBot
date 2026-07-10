@@ -37,6 +37,7 @@ from maxapi.context.state_machine import State, StatesGroup
 from maxapi.enums.parse_mode import TextFormat
 from maxapi.filters.command import Command, CommandStart
 from maxapi.types.attachments.buttons.callback_button import CallbackButton
+from maxapi.types.attachments.image import Image
 from maxapi.types.input_media import InputMedia
 from maxapi.types.updates.bot_started import BotStarted
 from maxapi.types.updates.message_callback import MessageCallback
@@ -157,7 +158,7 @@ RU_MONTHS_GENITIVE = {
 
 # Обновляется вручную при каждом релизе — по /time можно однозначно проверить,
 # какая версия кода реально работает на хостинге (без гадания по редеплою).
-BOT_CODE_VERSION = "2026-07-10-protocol-date-only-final"
+BOT_CODE_VERSION = "2026-07-10-photo-reports"
 
 
 class DutyScheduleGenerator:
@@ -426,10 +427,9 @@ class AdminWizard(StatesGroup):
     awaiting_protocol_pin = State()
 
 
-class SurveyWizard(StatesGroup):
-    """Состояние опроса по итогам дежурства (ТЗ п.2.2) — только текстовый
-    шаг «Замечания», остальные вопросы отвечаются кнопками через callback."""
-    awaiting_remarks = State()
+class ReportWizard(StatesGroup):
+    """Ожидание фотоотчёта о дежурстве взамен текстового опроса."""
+    awaiting_photo = State()
 
 
 class DutyBot:
@@ -445,6 +445,7 @@ class DutyBot:
         self.protocol_pinned_message_id = None
         self.download_dir = Path("downloads")
         self.protocol_dir = Path("protocols")
+        self.reports_dir = Path("duty_reports")
         self.scheduler = None
         self.load_user_data()
         self.load_shifts()
@@ -483,7 +484,8 @@ class DutyBot:
         dp.message_created(Command("test_wednesday"))(self.send_test_wednesday)
         dp.message_created(Command("test_friday"))(self.send_test_friday)
         dp.message_created(Command("test_saturday"))(self.send_test_saturday)
-        dp.message_created(Command("test_survey"))(self.send_test_survey)
+        dp.message_created(Command("test_report"))(self.send_test_report)
+        dp.message_created(Command("test_protocol_reminder"))(self.send_test_protocol_reminder)
         dp.message_created(Command("test_user"))(self.test_notification_for_user)
         dp.message_created(Command("users"))(self.check_users_status)
         dp.message_created(Command("enable_all"))(self.enable_notifications_all)
@@ -508,7 +510,7 @@ class DutyBot:
         dp.message_created(AdminWizard.awaiting_phone_edit)(self.wizard_phone_edit)
         dp.message_created(AdminWizard.awaiting_protocol_upload)(self.wizard_protocol_upload)
         dp.message_created(AdminWizard.awaiting_protocol_pin)(self.wizard_protocol_pin)
-        dp.message_created(SurveyWizard.awaiting_remarks)(self.wizard_survey_remarks)
+        dp.message_created(ReportWizard.awaiting_photo)(self.wizard_report_photo)
 
         # Файл прислан без активного состояния мастера — подскажем, что делать
         # (должно идти раньше общего текстового фолбэка)
@@ -541,17 +543,24 @@ class DutyBot:
             replace_existing=True
         )
         self.scheduler.add_job(
-            self.send_shift_survey,
+            self.send_duty_report_request,
             CronTrigger(day_of_week='sat', hour=SURVEY_CONFIG.get("send_hour", 8),
                         minute=SURVEY_CONFIG.get("send_minute", 0), second=0, timezone=MOSCOW_TZ),
-            id='shift_survey',
+            id='duty_report_request',
+            replace_existing=True
+        )
+        self.scheduler.add_job(
+            self.send_protocol_template_reminder,
+            CronTrigger(day_of_week='thu', hour=15, minute=0, second=0, timezone=MOSCOW_TZ),
+            id='protocol_template_reminder',
             replace_existing=True
         )
 
         self.scheduler.start()
         logger.info(
-            f"Планировщик задач запущен: среда 18:00, пятница 18:00, "
-            f"суббота {SURVEY_CONFIG.get('send_hour', 8):02d}:{SURVEY_CONFIG.get('send_minute', 0):02d} (опрос), суббота 10:00"
+            f"Планировщик задач запущен: среда 18:00, четверг 15:00 (бланк протокола), "
+            f"пятница 18:00, суббота {SURVEY_CONFIG.get('send_hour', 8):02d}:{SURVEY_CONFIG.get('send_minute', 0):02d} "
+            f"(фотоотчёт), суббота 10:00"
         )
 
     async def send_wednesday_notification(self):
@@ -705,53 +714,61 @@ class DutyBot:
     def _get_shift(self, shift_number: int) -> Optional[Dict]:
         return next((s for s in self.shifts if s.get("shift_number") == shift_number), None)
 
-    async def send_shift_survey(self, force: bool = False) -> Dict:
-        """Опрос по итогам дежурства (ТЗ п.2.2) — отправляется дежурному(ым) в
-        SURVEY_CONFIG['send_hour']:SURVEY_CONFIG['send_minute'] по субботам.
+    @staticmethod
+    def _parse_shift_date(date_str: str) -> datetime:
+        return datetime.strptime(date_str.replace("г.", "").strip(), "%d.%m.%Y")
 
-        force=True (команда /test_survey) снимает проверку дня недели и
-        повторной отправки — удобно для ручного тестирования в любой день.
+    def _enforce_report_photo_limit(self, limit: int = 5):
+        """Хранит на диске не больше `limit` фотоотчётов — удаляет файл самой
+        старой смены при превышении. Сама запись о смене (и факт "отправил")
+        остаётся для статистики, удаляется только файл."""
+        with_photo = [s for s in self.shifts if s.get("photo_path") and os.path.exists(s["photo_path"])]
+        with_photo.sort(key=lambda s: self._parse_shift_date(s["date"]))
+        while len(with_photo) > limit:
+            oldest = with_photo.pop(0)
+            try:
+                os.remove(oldest["photo_path"])
+                logger.info(f"Удалено фото смены №{oldest['shift_number']} (лимит {limit} файлов)")
+            except Exception as e:
+                logger.error(f"Не удалось удалить старое фото смены №{oldest['shift_number']}: {e}")
 
-        Возвращает словарь {ok, sent, employees, reason} — используется
-        /test_survey, чтобы явно показать, ушёл ли опрос кому-то реально,
-        а не просто молча отчитаться об «успехе»."""
+    async def send_duty_report_request(self, force: bool = False) -> Dict:
+        """Запрос фотоотчёта о дежурстве взамен текстового опроса — отправляется
+        дежурному(ым) в SURVEY_CONFIG['send_hour']:SURVEY_CONFIG['send_minute'] по субботам.
+
+        force=True (команда /test_report) снимает проверку дня недели и
+        повторной отправки — удобно для ручного тестирования в любой день."""
         try:
             today = datetime.now(MOSCOW_TZ).replace(tzinfo=None)
             if today.weekday() != 5 and not force:
-                logger.warning(f"send_shift_survey вызван не в субботу! День недели: {today.weekday()}")
+                logger.warning(f"send_duty_report_request вызван не в субботу! День недели: {today.weekday()}")
                 return {"ok": False, "sent": 0, "employees": [], "reason": "не суббота"}
 
             duty_today = self.schedule_generator.get_todays_duty()
             if not duty_today and force:
-                # Тестовый режим в будний день: берём ближайшее дежурство по кругу
                 current_schedule = self.schedule_generator._generate_dynamic_schedule()
                 if current_schedule:
                     duty_today = min(current_schedule.values(), key=lambda d: d["date_obj"])
             if not duty_today:
-                logger.info("Опрос по дежурству: дежурных нет, опрос не отправляется")
+                logger.info("Фотоотчёт: дежурных нет, запрос не отправляется")
                 return {"ok": False, "sent": 0, "employees": [], "reason": "нет дежурных в графике"}
 
-            date_str = today.strftime("%d.%m.%Yг.")
+            date_str = today.strftime("%d.%m.%Yг.") if not force else duty_today["date_obj"].strftime("%d.%m.%Yг.")
             if any(s["date"] == date_str for s in self.shifts) and not force:
-                logger.info(f"Опрос по смене {date_str} уже отправлялся, повторно не отправляем")
-                return {"ok": False, "sent": 0, "employees": [], "reason": "опрос по этой смене уже отправлялся"}
+                logger.info(f"Запрос фотоотчёта по смене {date_str} уже отправлялся, повторно не отправляем")
+                return {"ok": False, "sent": 0, "employees": [], "reason": "запрос по этой смене уже отправлялся"}
 
             shift_number = len(self.shifts) + 1
             shift = {
                 "shift_number": shift_number,
                 "date": date_str,
                 "employees": duty_today["employees"],
-                "survey": {},
-                "protocol_file": None,
+                "photo_submitted": False,
+                "photo_path": None,
                 "completed": False,
             }
             self.shifts.append(shift)
             self.save_shifts()
-
-            question = SURVEY_CONFIG["questions"]["quality"]
-            kb = InlineKeyboardBuilder()
-            for i, option in enumerate(question["options"]):
-                kb.row(CallbackButton(text=option, payload=f"survey|{shift_number}|quality|{i}"))
 
             sent_to = 0
             unlinked_employees = []
@@ -761,123 +778,98 @@ class DutyBot:
                     unlinked_employees.append(emp)
                 for uid in recipients:
                     try:
-                        await self.bot.send_message(
+                        sent = await self.bot.send_message(
                             user_id=int(uid),
-                            text=f"🔔 <b>ОПРОС ПО ИТОГАМ ДЕЖУРСТВА</b>\n\n{question['text']}",
-                            attachments=[kb.as_markup()],
+                            text="🔔 <b>ФОТООТЧЁТ О ДЕЖУРСТВЕ</b>\n\n"
+                                 "Пришлите, пожалуйста, фото протокола дежурства следующим сообщением.",
                             format=TextFormat.HTML
                         )
+                        # На случай, если chat_id для личной переписки не совпадает с user_id —
+                        # берём фактический chat_id из ответа на отправку, а не угадываем.
+                        resolved_chat_id = (
+                            sent.message.recipient.chat_id
+                            if sent and sent.message and sent.message.recipient else int(uid)
+                        )
+                        await self.dp.fsm.set_state(chat_id=resolved_chat_id, user_id=int(uid),
+                                                     state=ReportWizard.awaiting_photo)
+                        await self.dp.fsm.update_data(chat_id=resolved_chat_id, user_id=int(uid),
+                                                       report_shift_number=shift_number)
                         sent_to += 1
                     except Exception as e:
-                        logger.error(f"Не удалось отправить опрос пользователю {uid}: {e}")
+                        logger.error(f"Не удалось отправить запрос фотоотчёта пользователю {uid}: {e}")
 
             if unlinked_employees:
                 logger.warning(
-                    f"Опрос по смене №{shift_number}: сотрудники без привязанного "
+                    f"Фотоотчёт по смене №{shift_number}: сотрудники без привязанного "
                     f"пользователя бота — {', '.join(unlinked_employees)}"
                 )
 
-            logger.info(f"Опрос по смене №{shift_number} ({date_str}) отправлен {sent_to} получателям")
-            audit("system", None, "survey_sent", f"смена №{shift_number}, {date_str}, получателей: {sent_to}")
+            logger.info(f"Запрос фотоотчёта по смене №{shift_number} ({date_str}) отправлен {sent_to} получателям")
+            audit("system", None, "report_requested", f"смена №{shift_number}, {date_str}, получателей: {sent_to}")
             return {
                 "ok": True, "sent": sent_to, "employees": duty_today["employees"],
                 "unlinked": unlinked_employees, "shift_number": shift_number,
             }
         except Exception as e:
-            logger.error(f"Ошибка отправки опроса по дежурству: {e}")
+            logger.error(f"Ошибка отправки запроса фотоотчёта: {e}")
             return {"ok": False, "sent": 0, "employees": [], "reason": str(e)}
 
-    async def handle_survey_callback(self, event: MessageCallback, context: BaseContext):
-        """Обработка нажатий кнопок опроса: payload вида survey|{смена}|{вопрос}|{индекс}.
-        event.answer() уже вызван в on_callback перед диспетчеризацией."""
-        payload = event.callback.payload
-
-        try:
-            _, shift_number_str, question_key, option_index_str = payload.split("|")
-            shift_number = int(shift_number_str)
-            option_index = int(option_index_str)
-        except (ValueError, AttributeError) as e:
-            logger.error(f"Некорректный payload опроса '{payload}': {e}")
-            if event.message is not None:
-                await event.message.answer("❌ Не удалось обработать кнопку опроса.", format=TextFormat.HTML)
-            return
-
-        if event.message is None:
-            return
-
-        try:
-            shift = self._get_shift(shift_number)
-            if not shift:
-                logger.error(f"Опрос: смена №{shift_number} не найдена в shifts_history.json (всего смен: {len(self.shifts)})")
-                await event.message.answer(
-                    "❌ <b>Не удалось сохранить ответ</b>\n\nЭта смена больше не найдена в базе бота "
-                    "(вероятно, бот перезапускался и потерял данные). Запустите опрос заново через "
-                    "<code>/test_survey</code> или дождитесь субботы.",
-                    format=TextFormat.HTML
-                )
-                return
-
-            question = SURVEY_CONFIG["questions"][question_key]
-            answer_text = question["options"][option_index]
-            shift["survey"][question_key] = answer_text
-            self.save_shifts()
-
-            responder = event.callback.user
-            audit(str(responder.user_id), responder.username, "survey_answer",
-                  f"смена №{shift_number}, {question_key}={answer_text}")
-
-            order = ["quality", "incidents", "zgd"]
-            next_index = order.index(question_key) + 1 if question_key in order else len(order)
-
-            if next_index < len(order):
-                next_key = order[next_index]
-                next_question = SURVEY_CONFIG["questions"][next_key]
-                kb = InlineKeyboardBuilder()
-                for i, option in enumerate(next_question["options"]):
-                    kb.row(CallbackButton(text=option, payload=f"survey|{shift_number}|{next_key}|{i}"))
-                await event.message.edit(
-                    text=f"✅ Ответ сохранён: <b>{answer_text}</b>\n\n{next_question['text']}",
-                    attachments=[kb.as_markup()],
-                    format=TextFormat.HTML
-                )
-            else:
-                await event.message.edit(
-                    text=f"✅ Ответ сохранён: <b>{answer_text}</b>\n\n"
-                         f"📝 Последний шаг — напишите замечания текстом (или отправьте <code>-</code>, если их нет):",
-                    attachments=[],  # явно убираем кнопки Да/Нет — иначе message.edit() без attachments
-                                     # оставляет предыдущую клавиатуру видимой (она уже ни на что не влияет)
-                    format=TextFormat.HTML
-                )
-                await context.update_data(survey_shift_number=shift_number)
-                await context.set_state(SurveyWizard.awaiting_remarks)
-        except Exception as e:
-            logger.error(f"Ошибка обработки ответа на опрос (payload={payload}): {e}")
-            await event.message.answer(f"❌ Ошибка сохранения ответа: {str(e)[:200]}", format=TextFormat.HTML)
-
-    async def wizard_survey_remarks(self, event: MessageCreated, context: BaseContext):
+    async def wizard_report_photo(self, event: MessageCreated, context: BaseContext):
+        """Ждём фото протокола от дежурного. Любое другое сообщение (текст,
+        документ не-фото) — просим прислать именно фото, состояние не сбрасываем."""
         data = await context.get_data()
-        shift_number = data.get("survey_shift_number")
-        await context.clear()
-
+        shift_number = data.get("report_shift_number")
         shift = self._get_shift(shift_number) if shift_number else None
+
         if not shift:
-            await event.message.answer("❌ Не удалось найти смену для этого опроса.", format=TextFormat.HTML)
+            await context.clear()
+            await event.message.answer("❌ Не удалось найти смену для этого фотоотчёта.", format=TextFormat.HTML)
             return
 
-        remarks = (event.message.body.text or "").strip()
-        shift["survey"]["remarks"] = "" if remarks == "-" else remarks
-        shift["completed"] = True
-        self.save_shifts()
+        body = event.message.body
+        attachments = body.attachments if body else None
+        photo_attachment = None
+        for a in (attachments or []):
+            if isinstance(a, Image):
+                photo_attachment = a
+                break
 
-        sender = event.message.sender
-        audit(str(sender.user_id), sender.username, "survey_completed", f"смена №{shift_number}")
+        if not photo_attachment:
+            await event.message.answer(
+                "📷 Нужно именно фото. Пришлите, пожалуйста, фотографию протокола дежурства.",
+                format=TextFormat.HTML
+            )
+            return
 
-        await event.message.answer(
-            "✅ <b>ОПРОС ЗАВЕРШЁН</b>\n\nСпасибо! Протокол смены будет сформирован автоматически.",
-            format=TextFormat.HTML
-        )
+        url = self._get_attachment_url(photo_attachment)
+        if not url:
+            await event.message.answer("❌ Не удалось скачать фото, попробуйте отправить ещё раз.",
+                                        format=TextFormat.HTML)
+            return
 
-        await self._finalize_shift_protocol(shift, event.message.recipient.chat_id)
+        try:
+            self.reports_dir.mkdir(exist_ok=True)
+            downloaded_path = await self.bot.download_file(url, self.reports_dir)
+            date_compact = shift["date"].replace("г.", "").replace(".", "-")
+            final_path = self.reports_dir / f"Отчёт_{date_compact}_Смена{shift_number}{Path(downloaded_path).suffix}"
+            shutil.move(str(downloaded_path), str(final_path))
+
+            shift["photo_submitted"] = True
+            shift["photo_path"] = str(final_path)
+            shift["completed"] = True
+            self.save_shifts()
+            self._enforce_report_photo_limit()
+
+            sender = event.message.sender
+            audit(str(sender.user_id), sender.username, "report_photo_received", f"смена №{shift_number}")
+
+            await event.message.answer("✅ Спасибо! Фотоотчёт получен.", format=TextFormat.HTML)
+        except Exception as e:
+            logger.error(f"Ошибка сохранения фотоотчёта (смена №{shift_number}): {e}")
+            await event.message.answer(f"❌ Ошибка сохранения фото: {str(e)[:200]}", format=TextFormat.HTML)
+            return
+
+        await context.clear()
 
     def _fill_protocol_template(self, shift: Dict, file_path: Path):
         """Заполняет реальный бланк protocol_template.docx только датой
@@ -919,6 +911,52 @@ class DutyBot:
             audit("system", None, "protocol_generated", f"смена №{shift['shift_number']} -> {filename}")
         except Exception as e:
             logger.error(f"Ошибка формирования автопротокола: {e}")
+
+    async def send_protocol_template_reminder(self, force: bool = False) -> Dict:
+        """Каждый четверг в 15:00 отправляет пустой бланк protocol_template.docx
+        дежурному(ым) на ближайшую субботу — чтобы успели распечатать заранее."""
+        try:
+            today = datetime.now(MOSCOW_TZ).replace(tzinfo=None)
+            if today.weekday() != 3 and not force:
+                logger.warning(f"send_protocol_template_reminder вызван не в четверг! День недели: {today.weekday()}")
+                return {"ok": False, "sent": 0, "employees": [], "reason": "не четверг"}
+
+            if not PROTOCOL_TEMPLATE_PATH.exists():
+                return {"ok": False, "sent": 0, "employees": [], "reason": "файл бланка protocol_template.docx не найден"}
+
+            current_schedule = self.schedule_generator._generate_dynamic_schedule()
+            if not current_schedule:
+                return {"ok": False, "sent": 0, "employees": [], "reason": "график пуст"}
+            upcoming = min(current_schedule.values(), key=lambda d: d["date_obj"])
+            date_str = upcoming["date_obj"].strftime("%d.%m.%Y")
+
+            sent_to = 0
+            unlinked_employees = []
+            for emp in upcoming["employees"]:
+                recipients = self._get_user_ids_for_employee(emp)
+                if not recipients:
+                    unlinked_employees.append(emp)
+                for uid in recipients:
+                    try:
+                        await self.bot.send_message(
+                            user_id=int(uid),
+                            text=f"📄 Бланк протокола для дежурства {date_str}.\n"
+                                 f"Распечатайте заранее и возьмите с собой.",
+                            attachments=[InputMedia(path=str(PROTOCOL_TEMPLATE_PATH))],
+                        )
+                        sent_to += 1
+                    except Exception as e:
+                        logger.error(f"Не удалось отправить бланк протокола пользователю {uid}: {e}")
+
+            logger.info(f"Бланк протокола на {date_str} отправлен {sent_to} получателям")
+            audit("system", None, "protocol_reminder_sent", f"{date_str}, получателей: {sent_to}")
+            return {
+                "ok": True, "sent": sent_to, "employees": upcoming["employees"],
+                "unlinked": unlinked_employees, "date": date_str,
+            }
+        except Exception as e:
+            logger.error(f"Ошибка отправки напоминания с бланком протокола: {e}")
+            return {"ok": False, "sent": 0, "employees": [], "reason": str(e)}
 
     async def _send_notification_to_all_users(self, message: str, notification_type: str):
         """Отправка уведомлений ВСЕМ пользователям с проверкой ID.
@@ -992,10 +1030,10 @@ class DutyBot:
             logger.error(f"Ошибка сохранения user_data.json: {e}")
 
     def load_shifts(self):
-        """История дежурств для /stats и опроса по итогам смены (ТЗ п.2.1, 2.2).
+        """История дежурств для /stats и фотоотчётов о дежурстве (ТЗ п.2.1, 2.2).
 
-        Каждая запись: {shift_number, date (дд.мм.гггг), employees, survey:
-        {quality, incidents, zgd, remarks} | None, protocol_file, completed}.
+        Каждая запись: {shift_number, date (дд.мм.гггг), employees,
+        photo_submitted, photo_path, protocol_file, completed}.
         Статистика считается только по сменам, начиная с включения этой фичи —
         задним числом прошлые дежурства бот не восстанавливает."""
         if os.path.exists(self.shifts_file):
@@ -1080,6 +1118,7 @@ class DutyBot:
             CallbackButton(text="📁 Управление файлами", payload="admin_files"),
             CallbackButton(text="📊 Статистика", payload="admin_stats"),
         )
+        kb.row(CallbackButton(text="📋 Список дежурств", payload="admin_duty_reports"))
         kb.row(
             CallbackButton(text="🔙 В главное меню", payload="back_to_main"),
             CallbackButton(text="🚪 Выйти из админки", payload="admin_logout"),
@@ -1501,30 +1540,51 @@ class DutyBot:
         await self.send_saturday_notification_all()
         await event.message.answer("✅ Тестовое субботнее уведомление отправлено!")
 
-    async def send_test_survey(self, event: MessageCreated):
-        """/test_survey — ручной запуск опроса по дежурству для тестирования
+    async def send_test_report(self, event: MessageCreated):
+        """/test_report — ручной запуск запроса фотоотчёта для тестирования
         в любой день недели (force=True снимает проверку «только суббота»)."""
         user_id = str(event.message.sender.user_id)
         if not self.is_admin(user_id):
             return
-        await event.message.answer("🔄 Отправляю тестовый опрос по итогам дежурства...")
-        result = await self.send_shift_survey(force=True)
+        await event.message.answer("🔄 Отправляю тестовый запрос фотоотчёта...")
+        result = await self.send_duty_report_request(force=True)
 
         if not result["ok"]:
-            await event.message.answer(f"❌ Опрос не отправлен: {result['reason']}", format=TextFormat.HTML)
+            await event.message.answer(f"❌ Запрос не отправлен: {result['reason']}", format=TextFormat.HTML)
             return
 
-        text = f"Дежурные по графику: {', '.join(result['employees'])}\n📤 Реально получили опрос: {result['sent']}"
+        text = f"Дежурные по графику: {', '.join(result['employees'])}\n📤 Реально получили запрос: {result['sent']}"
         if result.get("unlinked"):
             text += (
                 f"\n\n⚠️ <b>Не привязаны ни к одному пользователю бота:</b> "
                 f"{', '.join(result['unlinked'])}\n"
-                f"Опрос им отправить некуда — сотрудник должен сначала написать /start "
+                f"Запрос им отправить некуда — сотрудник должен сначала написать /start "
                 f"и выбрать своё ФИО в меню."
             )
         if result["sent"] == 0:
-            text = "⚠️ Опрос создан, но <b>не ушёл ни одному получателю</b>.\n\n" + text
+            text = "⚠️ Смена создана, но запрос <b>не ушёл ни одному получателю</b>.\n\n" + text
 
+        await event.message.answer(text, format=TextFormat.HTML)
+
+    async def send_test_protocol_reminder(self, event: MessageCreated):
+        """/test_protocol_reminder — форсирует отправку пустого бланка протокола
+        дежурному на ближайшую субботу (обычно уходит по четвергам в 15:00)."""
+        user_id = str(event.message.sender.user_id)
+        if not self.is_admin(user_id):
+            return
+        await event.message.answer("🔄 Отправляю тестовое напоминание с бланком протокола...")
+        result = await self.send_protocol_template_reminder(force=True)
+
+        if not result["ok"]:
+            await event.message.answer(f"❌ Не отправлено: {result['reason']}", format=TextFormat.HTML)
+            return
+
+        text = (
+            f"Дежурные на {result['date']}: {', '.join(result['employees'])}\n"
+            f"📤 Реально получили бланк: {result['sent']}"
+        )
+        if result.get("unlinked"):
+            text += f"\n\n⚠️ Не привязаны к боту: {', '.join(result['unlinked'])}"
         await event.message.answer(text, format=TextFormat.HTML)
 
     async def send_test_protocol(self, event: MessageCreated):
@@ -1548,7 +1608,8 @@ class DutyBot:
             "shift_number": 0,
             "date": duty_today["date_obj"].strftime("%d.%m.%Yг."),
             "employees": duty_today["employees"],
-            "survey": {"quality": "Отлично", "incidents": "Нет", "zgd": "Нет", "remarks": ""},
+            "photo_submitted": False,
+            "photo_path": None,
             "protocol_file": None,
             "completed": True,
         }
@@ -1613,6 +1674,7 @@ class DutyBot:
             "admin_employees": self.show_admin_employees,
             "admin_files": self.show_admin_files,
             "admin_stats": self.show_admin_stats,
+            "admin_duty_reports": self.show_duty_reports_list,
             "admin_remove_duty": self.admin_remove_duty,
             "admin_add_employee": self.admin_add_employee,
             "admin_remove_employee": self.admin_remove_employee,
@@ -1688,9 +1750,6 @@ class DutyBot:
                 format=TextFormat.HTML
             )
 
-        elif payload.startswith("survey|"):
-            await self.handle_survey_callback(event, context)
-
         elif payload.startswith("access_approve|") or payload.startswith("access_deny|"):
             approved = payload.startswith("access_approve|")
             target_user_id = payload.split("|", 1)[1]
@@ -1759,6 +1818,8 @@ class DutyBot:
             title = "за всё время"
 
         counts: Dict[str, int] = {}
+        submitted: Dict[str, int] = {}
+        not_submitted: Dict[str, int] = {}
         total = 0
         for shift in self.shifts:
             try:
@@ -1770,6 +1831,10 @@ class DutyBot:
             for emp in shift.get("employees", []):
                 counts[emp] = counts.get(emp, 0) + 1
                 total += 1
+                if shift.get("photo_submitted"):
+                    submitted[emp] = submitted.get(emp, 0) + 1
+                else:
+                    not_submitted[emp] = not_submitted.get(emp, 0) + 1
 
         text = f"📊 <b>СТАТИСТИКА ДЕЖУРСТВ</b>\n<i>{title}</i>\n\n"
         if total == 0:
@@ -1777,8 +1842,10 @@ class DutyBot:
         else:
             for emp, cnt in sorted(counts.items(), key=lambda x: -x[1]):
                 pct = (cnt / total) * 100
-                text += f"• <b>{emp}</b> — {cnt} ({pct:.0f}%)\n"
+                s, ns = submitted.get(emp, 0), not_submitted.get(emp, 0)
+                text += f"• <b>{emp}</b> — {cnt} ({pct:.0f}%) | фотоотчёт: +{s}/-{ns}\n"
             text += f"\n<b>Всего дежурств за период:</b> {total}"
+            text += "\n<i>+N — прислал фотоотчёт, -N — не прислал</i>"
 
         return text
 
@@ -2184,6 +2251,54 @@ class DutyBot:
         kb.row(CallbackButton(text="🔙 Назад в админку", payload="admin_panel"))
         kb.row(CallbackButton(text="🔄 Обновить", payload="admin_stats"))
         await message.edit(text=text, attachments=[kb.as_markup()], format=TextFormat.HTML)
+
+    async def show_duty_reports_list(self, message, user_id, context=None):
+        """Последние 5 дежурств: кто дежурил / дата / фото протокола (или
+        отметка, что фото не прислали). Хранится максимум 5 файлов фото —
+        старые удаляются автоматически (см. _enforce_report_photo_limit)."""
+        recent = sorted(
+            (s for s in self.shifts if "photo_submitted" in s),
+            key=lambda s: self._parse_shift_date(s["date"]),
+            reverse=True,
+        )[:5]
+
+        if not recent:
+            kb = InlineKeyboardBuilder()
+            kb.row(CallbackButton(text="🔙 Назад в админку", payload="admin_panel"))
+            await message.edit(
+                text="📋 <b>СПИСОК ДЕЖУРСТВ</b>\n\nПока нет ни одной записи.",
+                attachments=[kb.as_markup()], format=TextFormat.HTML
+            )
+            return
+
+        text = "📋 <b>СПИСОК ДЕЖУРСТВ</b> (последние 5)\n\n"
+        photos_to_send = []
+        for i, shift in enumerate(recent, 1):
+            has_photo = shift.get("photo_path") and os.path.exists(shift["photo_path"])
+            text += (
+                f"<b>{i}.</b> Кто дежурил: {', '.join(shift['employees'])}\n"
+                f"   Дата: {shift['date']}\n"
+            )
+            if has_photo:
+                text += "   Фото протокола: ✅ есть (пришлю следующим сообщением)\n\n"
+                photos_to_send.append((i, shift))
+            elif shift.get("photo_submitted"):
+                text += "   Фото протокола: ⚠️ было прислано, но файл удалён (лимит 5 файлов)\n\n"
+            else:
+                text += "   Фото протокола: ❌ пользователь не отправил доказательства дежурства\n\n"
+
+        kb = InlineKeyboardBuilder()
+        kb.row(CallbackButton(text="🔙 Назад в админку", payload="admin_panel"))
+        await message.edit(text=text, attachments=[kb.as_markup()], format=TextFormat.HTML)
+
+        for i, shift in photos_to_send:
+            try:
+                await message.reply(
+                    text=f"📷 Фото №{i}: {', '.join(shift['employees'])}, {shift['date']}",
+                    attachments=[InputMedia(path=shift["photo_path"])],
+                )
+            except Exception as e:
+                logger.error(f"Не удалось отправить фото смены №{shift['shift_number']}: {e}")
 
     async def admin_remove_duty(self, message, user_id, context: BaseContext):
         schedule_text = self.schedule_generator.get_schedule_text()

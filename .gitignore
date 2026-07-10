@@ -6,6 +6,7 @@ venv/
 .venv/
 downloads/
 protocols/
+duty_reports/
 user_data.json
 shifts_history.json
 duty_schedule.json
