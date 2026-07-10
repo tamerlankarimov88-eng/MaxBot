@@ -158,7 +158,7 @@ RU_MONTHS_GENITIVE = {
 
 # Обновляется вручную при каждом релизе — по /time можно однозначно проверить,
 # какая версия кода реально работает на хостинге (без гадания по редеплою).
-BOT_CODE_VERSION = "2026-07-10-report-dedup-deadline"
+BOT_CODE_VERSION = "2026-07-10-reset-shifts-command"
 
 
 class DutyScheduleGenerator:
@@ -486,6 +486,7 @@ class DutyBot:
         dp.message_created(Command("test_saturday"))(self.send_test_saturday)
         dp.message_created(Command("test_report"))(self.send_test_report)
         dp.message_created(Command("test_protocol_reminder"))(self.send_test_protocol_reminder)
+        dp.message_created(Command("reset_shifts"))(self.cmd_reset_shifts)
         dp.message_created(Command("test_user"))(self.test_notification_for_user)
         dp.message_created(Command("users"))(self.check_users_status)
         dp.message_created(Command("enable_all"))(self.enable_notifications_all)
@@ -1612,6 +1613,46 @@ class DutyBot:
         if result.get("unlinked"):
             text += f"\n\n⚠️ Не привязаны к боту: {', '.join(result['unlinked'])}"
         await event.message.answer(text, format=TextFormat.HTML)
+
+    async def cmd_reset_shifts(self, event: MessageCreated):
+        """/reset_shifts confirm — полностью очищает историю дежурств
+        (shifts_history.json + все сохранённые фото), включая накопленные
+        тестовые/дублирующиеся записи. Влияет на /stats и «Список дежурств»."""
+        user_id = str(event.message.sender.user_id)
+        if not self.is_authorized_admin(user_id):
+            return
+
+        args = self._parse_args(event)
+        if not args or args[0].lower() != "confirm":
+            await event.message.answer(
+                "⚠️ <b>Это удалит ВСЮ историю дежурств</b> (статистику, список дежурств, "
+                "сохранённые фото) — включая тестовые записи.\n\n"
+                "Чтобы подтвердить: <code>/reset_shifts confirm</code>",
+                format=TextFormat.HTML
+            )
+            return
+
+        deleted_photos = 0
+        for shift in self.shifts:
+            photo_path = shift.get("photo_path")
+            if photo_path and os.path.exists(photo_path):
+                try:
+                    os.remove(photo_path)
+                    deleted_photos += 1
+                except Exception as e:
+                    logger.error(f"Не удалось удалить фото {photo_path}: {e}")
+
+        shifts_count = len(self.shifts)
+        self.shifts = []
+        self.save_shifts()
+
+        audit(user_id, event.message.sender.username, "shifts_reset",
+              f"удалено записей: {shifts_count}, фото: {deleted_photos}")
+        await event.message.answer(
+            f"✅ История дежурств очищена.\n\n"
+            f"Удалено записей: {shifts_count}\nУдалено фото: {deleted_photos}",
+            format=TextFormat.HTML
+        )
 
     async def send_test_protocol(self, event: MessageCreated):
         """/test_protocol — сразу генерирует и присылает .docx протокол, без
