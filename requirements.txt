@@ -2,3 +2,4 @@ maxapi
 pytz
 apscheduler
 python-dotenv
+python-docx

@@ -5,4 +5,7 @@ __pycache__/
 venv/
 .venv/
 downloads/
+protocols/
 user_data.json
+shifts_history.json
+audit.log

@@ -10,5 +10,26 @@
   },
   "duty_rotation_circle": [
     "Фамилия И.О."
-  ]
+  ],
+  "admin_ids": [123456789],
+  "whitelist_mode": false,
+  "survey": {
+    "send_hour": 8,
+    "send_minute": 0,
+    "questions": {
+      "quality": {
+        "text": "Как прошло дежурство?",
+        "options": ["Отлично", "Хорошо", "Были сложности", "Плохо"]
+      },
+      "incidents": {
+        "text": "Были ли инциденты?",
+        "options": ["Да", "Нет"]
+      },
+      "zgd": {
+        "text": "Были ли ЗГД?",
+        "options": ["Да", "Нет"]
+      }
+    }
+  },
+  "protocol_filename_mask": "Протокол Разногласий_{date}_Смена{shift_number}.docx"
 }
