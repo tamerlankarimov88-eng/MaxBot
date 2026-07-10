@@ -157,7 +157,7 @@ RU_MONTHS_GENITIVE = {
 
 # Обновляется вручную при каждом релизе — по /time можно однозначно проверить,
 # какая версия кода реально работает на хостинге (без гадания по редеплою).
-BOT_CODE_VERSION = "2026-07-10-test-protocol-command"
+BOT_CODE_VERSION = "2026-07-10-protocol-date-only-final"
 
 
 class DutyScheduleGenerator:
@@ -880,9 +880,8 @@ class DutyBot:
         await self._finalize_shift_protocol(shift, event.message.recipient.chat_id)
 
     def _fill_protocol_template(self, shift: Dict, file_path: Path):
-        """Заполняет реальный бланк protocol_template.docx датой дежурства и
-        ФИО дежурных (инициалами — они уже в этом формате: "Фамилия И.О.").
-        Больше ничего не меняется — ни таблица с ответами, ни блок подписей."""
+        """Заполняет реальный бланк protocol_template.docx только датой
+        дежурства — больше ничего в бланке не меняется."""
         doc = Document(str(PROTOCOL_TEMPLATE_PATH))
 
         day, month, year_g = shift["date"].replace("г.", "").split(".")
@@ -890,19 +889,6 @@ class DutyBot:
         date_para.runs[2].text = day
         date_para.runs[4].text = RU_MONTHS_GENITIVE.get(int(month), month)
         date_para.runs[6].text = f"{year_g}г."
-
-        table = doc.tables[0]
-        employees = shift["employees"]
-        for i, emp in enumerate(employees[:2]):
-            fio_cell = table.rows[0].cells[i + 1]
-            fio_cell.paragraphs[1].runs[0].text = emp
-
-        # Строка "Да"/"Нет" в шаблоне — это просто пример заполнения, не реальные
-        # данные. Очищаем её текст, оставляя саму строку таблицы (с рамками) пустой.
-        for cell in table.rows[1].cells:
-            for para in cell.paragraphs:
-                for run in para.runs:
-                    run.text = ""
 
         doc.save(str(file_path))
 
