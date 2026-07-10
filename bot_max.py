@@ -148,7 +148,7 @@ RU_MONTHS_GENITIVE = {
 
 # Обновляется вручную при каждом релизе — по /time можно однозначно проверить,
 # какая версия кода реально работает на хостинге (без гадания по редеплою).
-BOT_CODE_VERSION = "2026-07-10-real-protocol-template"
+BOT_CODE_VERSION = "2026-07-10-date-only-in-protocol"
 
 
 class DutyScheduleGenerator:
@@ -837,15 +837,9 @@ class DutyBot:
         await self._finalize_shift_protocol(shift, event.message.recipient.chat_id)
 
     def _fill_protocol_template(self, shift: Dict, file_path: Path):
-        """Заполняет реальный бланк protocol_template.docx (тот, что использует
-        компания при дежурствах) данными смены — вместо генерации файла с нуля.
-
-        Что подставляется:
-        - дата в формате «ДД» месяц ГГГГг. (как в оригинальном бланке)
-        - в шапку таблицы («Сторона 1»/«Сторона 2») — реальные дежурные
-        - строки таблицы («Наименование») — по одной на каждый вопрос опроса,
-          с общим ответом в обеих колонках (опрос общий, не по каждой стороне отдельно)
-        Блок подписей внизу НЕ трогается — это бланк для ручной подписи после печати."""
+        """Заполняет реальный бланк protocol_template.docx датой смены (ТЗ п.2.5:
+        «Содержимое протокола включает: дату смены и т.д.») — больше ничего в
+        бланке не меняется, таблица и блок подписей остаются как в оригинале."""
         doc = Document(str(PROTOCOL_TEMPLATE_PATH))
 
         day, month, year_g = shift["date"].replace("г.", "").split(".")
@@ -853,34 +847,6 @@ class DutyBot:
         date_para.runs[2].text = day
         date_para.runs[4].text = RU_MONTHS_GENITIVE.get(int(month), month)
         date_para.runs[6].text = f"{year_g}г."
-
-        table = doc.tables[0]
-        employees = shift["employees"]
-        for i in range(2):
-            cell = table.rows[0].cells[i + 1]
-            emp = employees[i] if i < len(employees) else None
-            cell.paragraphs[0].runs[2].text = "Должность: Дежурный" if emp else "—"
-            cell.paragraphs[1].runs[0].text = emp if emp else "—"
-
-        survey = shift.get("survey", {})
-        questions = [
-            ("Как прошло дежурство?", survey.get("quality", "—")),
-            ("Были ли инциденты?", survey.get("incidents", "—")),
-            ("Были ли ЗГД?", survey.get("zgd", "—")),
-        ]
-        row1 = table.rows[1]
-        row1.cells[0].paragraphs[0].add_run(questions[0][0])
-        row1.cells[1].paragraphs[0].runs[0].text = questions[0][1]
-        row1.cells[2].paragraphs[0].runs[0].text = questions[0][1]
-        for q_text, answer in questions[1:]:
-            new_row = table.add_row()
-            new_row.cells[0].paragraphs[0].add_run(q_text)
-            new_row.cells[1].paragraphs[0].add_run(answer)
-            new_row.cells[2].paragraphs[0].add_run(answer)
-
-        remarks = survey.get("remarks")
-        if remarks:
-            doc.add_paragraph(f"Замечания: {remarks}")
 
         doc.save(str(file_path))
 
