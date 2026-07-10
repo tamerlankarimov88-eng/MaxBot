@@ -99,9 +99,6 @@ ADMIN_CREDENTIALS = {
     "password": _config["admin_password"]
 }
 
-# СПЕЦИАЛЬНЫЙ АДМИН - ТОЛЬКО ЭТОТ ПОЛЬЗОВАТЕЛЬ МОЖЕТ ЗАПУСКАТЬ ДИАГНОСТИЧЕСКИЕ КОМАНДЫ
-SUPER_ADMIN_USERNAME = _config["super_admin_username"]
-
 # Соответствие username в MAX сотрудникам
 USERNAME_TO_EMPLOYEE = _config["username_to_employee"]
 
@@ -142,7 +139,7 @@ PROTOCOL_FILENAME_MASK = _config.get(
 
 # Обновляется вручную при каждом релизе — по /time можно однозначно проверить,
 # какая версия кода реально работает на хостинге (без гадания по редеплою).
-BOT_CODE_VERSION = "2026-07-10-super-admin-fix"
+BOT_CODE_VERSION = "2026-07-10-no-username-gates"
 
 
 class DutyScheduleGenerator:
@@ -446,6 +443,7 @@ class DutyBot:
         dp.message_created(Command("contact"))(self.cmd_contact)
         dp.message_created(Command("set_phone"))(self.cmd_set_phone)
         dp.message_created(Command("set_schedule"))(self.cmd_set_schedule)
+        dp.message_created(Command("myid"))(self.cmd_myid)
 
         dp.message_callback()(self.on_callback)
 
@@ -973,13 +971,6 @@ class DutyBot:
         info = self.user_data.get(user_id, {})
         return bool(info.get("whitelisted") or info.get("selected_employee"))
 
-    def is_super_admin(self, username: Optional[str]) -> bool:
-        if not username:
-            return False
-        if not username.startswith('@'):
-            username = '@' + username
-        return username.lower() == SUPER_ADMIN_USERNAME.lower()
-
     def get_employee_by_username(self, username: str) -> Optional[str]:
         if not username.startswith('@'):
             username = '@' + username
@@ -1245,9 +1236,9 @@ class DutyBot:
 
     async def check_users_status(self, event: MessageCreated):
         sender = event.message.sender
-        if not (self.is_super_admin(sender.username) or self.is_authorized_admin(str(sender.user_id))):
+        if not self.is_authorized_admin(str(sender.user_id)):
             await event.message.answer(
-                f"❌ <b>ДОСТУП ЗАПРЕЩЕН</b>\n\nЭта команда доступна {SUPER_ADMIN_USERNAME} или админам, вошедшим через /admin",
+                "❌ <b>ДОСТУП ЗАПРЕЩЕН</b>\n\nЭта команда доступна только админам, вошедшим через /admin",
                 format=TextFormat.HTML
             )
             return
@@ -1282,7 +1273,7 @@ class DutyBot:
 
     async def enable_notifications_all(self, event: MessageCreated):
         sender = event.message.sender
-        if not (self.is_super_admin(sender.username) or self.is_authorized_admin(str(sender.user_id))):
+        if not self.is_authorized_admin(str(sender.user_id)):
             return
 
         self.load_user_data()
@@ -1299,7 +1290,7 @@ class DutyBot:
 
     async def test_send_to_user(self, event: MessageCreated):
         sender = event.message.sender
-        if not (self.is_super_admin(sender.username) or self.is_authorized_admin(str(sender.user_id))):
+        if not self.is_authorized_admin(str(sender.user_id)):
             return
 
         args = self._parse_args(event)
@@ -1339,7 +1330,7 @@ class DutyBot:
 
     async def check_time(self, event: MessageCreated):
         sender = event.message.sender
-        if not (self.is_super_admin(sender.username) or self.is_authorized_admin(str(sender.user_id))):
+        if not self.is_authorized_admin(str(sender.user_id)):
             return
 
         now = datetime.now(MOSCOW_TZ)
@@ -1371,7 +1362,7 @@ class DutyBot:
 
     async def fix_all_users(self, event: MessageCreated):
         sender = event.message.sender
-        if not (self.is_super_admin(sender.username) or self.is_authorized_admin(str(sender.user_id))):
+        if not self.is_authorized_admin(str(sender.user_id)):
             return
 
         self.load_user_data()
@@ -1779,6 +1770,18 @@ class DutyBot:
             "➕ Добавить дежурство / ➖ Удалить дежурство / 📋 Просмотреть график:"
         )
         await event.message.answer(text, attachments=[self.get_schedule_admin_keyboard()], format=TextFormat.HTML)
+
+    async def cmd_myid(self, event: MessageCreated):
+        """/myid — без проверки прав: показывает числовой ID отправителя,
+        чтобы его можно было вписать в config.json -> admin_ids. Доступ по
+        username больше нигде в боте не используется — только по ID/логину."""
+        sender = event.message.sender
+        await event.message.answer(
+            f"🆔 Ваш ID: <code>{sender.user_id}</code>\n\n"
+            f"Чтобы получить права админа без /admin login — добавьте это число "
+            f"в config.json (или CONFIG_JSON) -> <code>admin_ids</code>.",
+            format=TextFormat.HTML
+        )
 
     # ================= ЗАЩИТА ОТ ПОСТОРОННИХ (ТЗ п.2.4) =================
 
