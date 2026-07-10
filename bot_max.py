@@ -432,6 +432,7 @@ class DutyBot:
         dp.message_created(Command("test_wednesday"))(self.send_test_wednesday)
         dp.message_created(Command("test_friday"))(self.send_test_friday)
         dp.message_created(Command("test_saturday"))(self.send_test_saturday)
+        dp.message_created(Command("test_survey"))(self.send_test_survey)
         dp.message_created(Command("test_user"))(self.test_notification_for_user)
         dp.message_created(Command("users"))(self.check_users_status)
         dp.message_created(Command("enable_all"))(self.enable_notifications_all)
@@ -651,22 +652,30 @@ class DutyBot:
     def _get_shift(self, shift_number: int) -> Optional[Dict]:
         return next((s for s in self.shifts if s.get("shift_number") == shift_number), None)
 
-    async def send_shift_survey(self):
+    async def send_shift_survey(self, force: bool = False):
         """Опрос по итогам дежурства (ТЗ п.2.2) — отправляется дежурному(ым) в
-        SURVEY_CONFIG['send_hour']:SURVEY_CONFIG['send_minute'] по субботам."""
+        SURVEY_CONFIG['send_hour']:SURVEY_CONFIG['send_minute'] по субботам.
+
+        force=True (команда /test_survey) снимает проверку дня недели и
+        повторной отправки — удобно для ручного тестирования в любой день."""
         try:
             today = datetime.now(MOSCOW_TZ).replace(tzinfo=None)
-            if today.weekday() != 5:
+            if today.weekday() != 5 and not force:
                 logger.warning(f"send_shift_survey вызван не в субботу! День недели: {today.weekday()}")
                 return
 
             duty_today = self.schedule_generator.get_todays_duty()
+            if not duty_today and force:
+                # Тестовый режим в будний день: берём ближайшее дежурство по кругу
+                current_schedule = self.schedule_generator._generate_dynamic_schedule()
+                if current_schedule:
+                    duty_today = min(current_schedule.values(), key=lambda d: d["date_obj"])
             if not duty_today:
-                logger.info("Опрос по дежурству: сегодня дежурных нет, опрос не отправляется")
+                logger.info("Опрос по дежурству: дежурных нет, опрос не отправляется")
                 return
 
             date_str = today.strftime("%d.%m.%Yг.")
-            if any(s["date"] == date_str for s in self.shifts):
+            if any(s["date"] == date_str for s in self.shifts) and not force:
                 logger.info(f"Опрос по смене {date_str} уже отправлялся, повторно не отправляем")
                 return
 
@@ -1392,6 +1401,16 @@ class DutyBot:
         await event.message.answer("🔄 Отправляю тестовое субботнее уведомление всем пользователям...")
         await self.send_saturday_notification_all()
         await event.message.answer("✅ Тестовое субботнее уведомление отправлено!")
+
+    async def send_test_survey(self, event: MessageCreated):
+        """/test_survey — ручной запуск опроса по дежурству для тестирования
+        в любой день недели (force=True снимает проверку «только суббота»)."""
+        user_id = str(event.message.sender.user_id)
+        if not self.is_admin(user_id):
+            return
+        await event.message.answer("🔄 Отправляю тестовый опрос по итогам дежурства...")
+        await self.send_shift_survey(force=True)
+        await event.message.answer("✅ Тестовый опрос отправлен (дежурному(ым) в личные сообщения)!")
 
     async def test_notification_for_user(self, event: MessageCreated):
         user_id = str(event.message.sender.user_id)
