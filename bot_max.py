@@ -60,10 +60,12 @@ _audit_handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s'))
 audit_logger.addHandler(_audit_handler)
 
 
-def audit(user_id: str, username: Optional[str], action: str, details: str = ""):
-    """Пишет строку в audit.log: кто, когда, что сделал (ТЗ п.3)."""
-    who = f"{user_id}(@{username})" if username else user_id
-    audit_logger.info(f"{who} | {action}" + (f" | {details}" if details else ""))
+def audit(user_id: str, action: str, details: str = ""):
+    """Пишет строку в audit.log: кто, когда, что сделал (ТЗ п.3).
+
+    Идентифицируем пользователя только по числовому ID — username нигде
+    в боте больше не хранится и не используется."""
+    audit_logger.info(f"{user_id} | {action}" + (f" | {details}" if details else ""))
 
 # Часовой пояс (Москва)
 MOSCOW_TZ = pytz.timezone('Europe/Moscow')
@@ -100,26 +102,31 @@ ADMIN_CREDENTIALS = {
     "password": _config["admin_password"]
 }
 
-# Соответствие username в MAX сотрудникам
-USERNAME_TO_EMPLOYEE = _config["username_to_employee"]
-
 # Телефоны сотрудников
 EMPLOYEE_PHONES = _config["employee_phones"]
 
 # Строгая последовательность дежурств по кругу
 DUTY_ROTATION_CIRCLE = _config["duty_rotation_circle"]
 
-# Исходный базовый список для хранения ручных правок админов
-DUTY_SCHEDULE = [
-    {
-        "date": "11.07.2026г.", "date_obj": datetime(2026, 7, 11),
-        "employees": ["Лызина С.В."], "phones": ["8-919-635-55-06"], "is_pair": False,
-    },
-    {
-        "date": "18.07.2026г.", "date_obj": datetime(2026, 7, 18),
-        "employees": ["Коробова И.А."], "phones": ["8-917-858-22-50"], "is_pair": False,
-    },
-]
+# Исходный базовый список ручных дежурств — читается из config.json/CONFIG_JSON
+# (ключ "duty_schedule"), а не хранится в коде: здесь были бы реальные ФИО и
+# телефоны сотрудников, которым не место в публичном репозитории. Формат
+# элемента в конфиге: {"date": "дд.мм.гггг" (можно с "г." на конце),
+# "employees": [...], "phones": [...], "is_pair": true/false}.
+def _parse_duty_date(date_str: str) -> datetime:
+    return datetime.strptime(date_str.replace("г.", "").strip(), "%d.%m.%Y")
+
+
+DUTY_SCHEDULE: List[Dict] = []
+for _item in _config.get("duty_schedule", []):
+    _date_str = _item["date"] if _item["date"].endswith("г.") else _item["date"] + "г."
+    DUTY_SCHEDULE.append({
+        "date": _date_str,
+        "date_obj": _parse_duty_date(_item["date"]),
+        "employees": _item["employees"],
+        "phones": _item["phones"],
+        "is_pair": _item.get("is_pair", False),
+    })
 
 # user_id администраторов, которым при первом запуске бота автоматически
 # выдаются права админа (ТЗ п.3, "Безопасность": проверка по списку ADMIN_IDS).
@@ -158,7 +165,7 @@ RU_MONTHS_GENITIVE = {
 
 # Обновляется вручную при каждом релизе — по /time можно однозначно проверить,
 # какая версия кода реально работает на хостинге (без гадания по редеплою).
-BOT_CODE_VERSION = "2026-07-10-reset-shifts-command"
+BOT_CODE_VERSION = "2026-07-16-admin-approval-no-username"
 
 
 class DutyScheduleGenerator:
@@ -460,7 +467,7 @@ class DutyBot:
             uid = str(admin_id)
             if uid not in self.user_data:
                 self.user_data[uid] = {
-                    "username": None, "first_name": None, "last_name": None,
+                    "first_name": None, "last_name": None,
                     "display_name": "Админ (ADMIN_IDS)", "notifications": True,
                     "selected_employee": None, "registered_at": datetime.now().isoformat(),
                     "last_active": datetime.now().isoformat(), "is_admin": True,
@@ -822,7 +829,7 @@ class DutyBot:
                 )
 
             logger.info(f"Запрос фотоотчёта по смене №{shift_number} ({date_str}) отправлен {sent_to} получателям")
-            audit("system", None, "report_requested", f"смена №{shift_number}, {date_str}, получателей: {sent_to}")
+            audit("system", "report_requested", f"смена №{shift_number}, {date_str}, получателей: {sent_to}")
             return {
                 "ok": True, "sent": sent_to, "employees": duty_today["employees"],
                 "unlinked": unlinked_employees, "shift_number": shift_number,
@@ -888,7 +895,7 @@ class DutyBot:
             self._enforce_report_photo_limit()
 
             sender = event.message.sender
-            audit(str(sender.user_id), sender.username, "report_photo_received", f"смена №{shift_number}")
+            audit(str(sender.user_id), "report_photo_received", f"смена №{shift_number}")
 
             await event.message.answer("✅ Спасибо! Фотоотчёт получен.", format=TextFormat.HTML)
         except Exception as e:
@@ -935,7 +942,7 @@ class DutyBot:
                     await self.bot.pin_message(chat_id=chat_id, message_id=mid)
 
             logger.info(f"Автопротокол смены №{shift['shift_number']} сформирован: {file_path}")
-            audit("system", None, "protocol_generated", f"смена №{shift['shift_number']} -> {filename}")
+            audit("system", "protocol_generated", f"смена №{shift['shift_number']} -> {filename}")
         except Exception as e:
             logger.error(f"Ошибка формирования автопротокола: {e}")
 
@@ -976,7 +983,7 @@ class DutyBot:
                         logger.error(f"Не удалось отправить бланк протокола пользователю {uid}: {e}")
 
             logger.info(f"Бланк протокола на {date_str} отправлен {sent_to} получателям")
-            audit("system", None, "protocol_reminder_sent", f"{date_str}, получателей: {sent_to}")
+            audit("system", "protocol_reminder_sent", f"{date_str}, получателей: {sent_to}")
             return {
                 "ok": True, "sent": sent_to, "employees": upcoming["employees"],
                 "unlinked": unlinked_employees, "date": date_str,
@@ -1100,19 +1107,14 @@ class DutyBot:
 
     def is_whitelisted(self, user_id: str) -> bool:
         """Защита от посторонних (ТЗ п.2.4). Если WHITELIST_MODE выключен в
-        конфиге — доступ открыт всем, как и было раньше. Сотрудники, автоматически
-        привязанные по username из config.json, и админы считаются доверенными сразу."""
+        конфиге — доступ открыт всем, как и было раньше. Сотрудники, вручную
+        выбравшие себя из списка ФИО, и админы считаются доверенными сразу."""
         if not WHITELIST_MODE:
             return True
         if self.is_admin(user_id) or self.is_authorized_admin(user_id):
             return True
         info = self.user_data.get(user_id, {})
         return bool(info.get("whitelisted") or info.get("selected_employee"))
-
-    def get_employee_by_username(self, username: str) -> Optional[str]:
-        if not username.startswith('@'):
-            username = '@' + username
-        return USERNAME_TO_EMPLOYEE.get(username.lower())
 
     # ================= КЛАВИАТУРЫ =================
 
@@ -1220,14 +1222,16 @@ class DutyBot:
         parts = text.split()
         return parts[1:] if len(parts) > 1 else []
 
-    def _register_user_and_build_welcome(self, user_id: str, username: Optional[str],
+    def _register_user_and_build_welcome(self, user_id: str,
                                           first_name: Optional[str], last_name: Optional[str]):
         """Регистрирует пользователя (если это первый заход) и собирает текст+клавиатуру
         приветственного меню. Используется и командой /start, и авто-показом меню при
-        открытии чата с ботом (BotStarted) — единая точка правды для обоих путей."""
+        открытии чата с ботом (BotStarted) — единая точка правды для обоих путей.
+
+        Username нигде не хранится и не используется — привязка к сотруднику
+        только вручную, через выбор ФИО из списка."""
         if user_id not in self.user_data:
             self.user_data[user_id] = {
-                "username": username,
                 "first_name": first_name,
                 "last_name": last_name,
                 "display_name": f"{first_name or ''} {last_name or ''}".strip(),
@@ -1237,11 +1241,6 @@ class DutyBot:
                 "last_active": datetime.now().isoformat(),
                 "is_admin": False
             }
-
-            if username:
-                employee_name = self.get_employee_by_username(username)
-                if employee_name:
-                    self.user_data[user_id]["selected_employee"] = employee_name
 
             self.save_user_data()
 
@@ -1285,10 +1284,8 @@ class DutyBot:
             welcome_text = (
                 f"<b>ДОБРО ПОЖАЛОВАТЬ, {first_name}!</b>\n\n"
                 "Я бот для управления графиком дежурств.\n\n"
+                "<i>Пожалуйста, выберите ваше ФИО из списка:</i>"
             )
-            if username:
-                welcome_text += f"Ваш username: @{username}\n"
-            welcome_text += "<i>Пожалуйста, выберите ваше ФИО из списка:</i>"
             keyboard = self.get_employee_selection_keyboard(prefix="emp_")
 
         return welcome_text, keyboard
@@ -1297,7 +1294,7 @@ class DutyBot:
         sender = event.message.sender
         user_id = str(sender.user_id)
         welcome_text, keyboard = self._register_user_and_build_welcome(
-            user_id, sender.username, sender.first_name, sender.last_name
+            user_id, sender.first_name, sender.last_name
         )
         await event.message.answer(
             welcome_text,
@@ -1311,7 +1308,7 @@ class DutyBot:
         user = event.user
         user_id = str(user.user_id)
         welcome_text, keyboard = self._register_user_and_build_welcome(
-            user_id, user.username, user.first_name, user.last_name
+            user_id, user.first_name, user.last_name
         )
         await self.bot.send_message(
             user_id=user.user_id,
@@ -1321,6 +1318,15 @@ class DutyBot:
         )
 
     async def admin_login(self, event: MessageCreated):
+        """/admin логин пароль.
+
+        Правильный пароль сам по себе больше не выдаёт прав администратора —
+        это только первый фактор. Дальше запрос уходит уже действующим
+        админам (тем, у кого is_admin=True — то есть уже вошедшим через
+        /admin, либо перечисленным в ADMIN_IDS) с кнопками «Принять/Отклонить»
+        и указанием, кто именно пытается войти. Права выдаются только после
+        подтверждения. Пользователи из ADMIN_IDS подтверждение проходят
+        автоматически — они и так уже доверены конфигом."""
         sender = event.message.sender
         user_id = str(sender.user_id)
         args = self._parse_args(event)
@@ -1334,25 +1340,39 @@ class DutyBot:
 
         login, password = args[0], args[1]
 
-        if login == ADMIN_CREDENTIALS["login"] and password == ADMIN_CREDENTIALS["password"]:
-            if user_id not in self.user_data:
-                # Логин без предварительного /start — заводим карточку пользователя,
-                # иначе is_admin/admin_logged_in было бы некуда сохранить.
-                self.user_data[user_id] = {
-                    "username": sender.username, "first_name": sender.first_name,
-                    "last_name": sender.last_name,
-                    "display_name": f"{sender.first_name or ''} {sender.last_name or ''}".strip(),
-                    "notifications": True, "selected_employee": None,
-                    "registered_at": datetime.now().isoformat(),
-                    "last_active": datetime.now().isoformat(), "is_admin": False,
-                }
+        if login != ADMIN_CREDENTIALS["login"] or password != ADMIN_CREDENTIALS["password"]:
+            audit(user_id, "admin_login_failed")
+            await event.message.answer(
+                "❌ <b>НЕВЕРНЫЙ ЛОГИН ИЛИ ПАРОЛЬ</b>\n\nПопробуйте снова:\n",
+                format=TextFormat.HTML
+            )
+            return
 
+        if user_id not in self.user_data:
+            # Логин без предварительного /start — заводим карточку пользователя,
+            # иначе admin_request_status/is_admin было бы некуда сохранить.
+            self.user_data[user_id] = {
+                "first_name": sender.first_name, "last_name": sender.last_name,
+                "display_name": f"{sender.first_name or ''} {sender.last_name or ''}".strip(),
+                "notifications": True, "selected_employee": None,
+                "registered_at": datetime.now().isoformat(),
+                "last_active": datetime.now().isoformat(), "is_admin": False,
+            }
+            self.save_user_data()
+
+        # Пользователи из ADMIN_IDS уже доверены конфигом — им подтверждение
+        # от других админов не требуется, пароль верный, входим сразу.
+        try:
+            pre_authorized = int(user_id) in ADMIN_IDS
+        except ValueError:
+            pre_authorized = False
+
+        if pre_authorized:
             self.user_data[user_id]["is_admin"] = True
             self.user_data[user_id]["admin_logged_in"] = True
             self.user_data[user_id]["admin_login_time"] = datetime.now().isoformat()
             self.save_user_data()
-            audit(user_id, sender.username, "admin_login_success")
-
+            audit(user_id, "admin_login_success")
             await event.message.answer(
                 "✅ <b>УСПЕШНЫЙ ВХОД В АДМИН-ПАНЕЛЬ</b>\n\n"
                 "Доступные функции:\n"
@@ -1364,12 +1384,82 @@ class DutyBot:
                 attachments=[self.get_admin_keyboard()],
                 format=TextFormat.HTML
             )
-        else:
-            audit(user_id, sender.username, "admin_login_failed")
+            return
+
+        if self.user_data[user_id].get("admin_request_status") == "pending":
             await event.message.answer(
-                "❌ <b>НЕВЕРНЫЙ ЛОГИН ИЛИ ПАРОЛЬ</b>\n\nПопробуйте снова:\n",
+                "⏳ Пароль верный, запрос уже отправлен действующим администраторам. Ожидайте подтверждения.",
                 format=TextFormat.HTML
             )
+            return
+
+        self.user_data[user_id]["admin_request_status"] = "pending"
+        self.save_user_data()
+
+        display_name = self.user_data[user_id].get("display_name") or "Без имени"
+        kb = InlineKeyboardBuilder()
+        kb.row(
+            CallbackButton(text="✅ Принять", payload=f"admin_approve|{user_id}"),
+            CallbackButton(text="❌ Отклонить", payload=f"admin_deny|{user_id}"),
+        )
+        notify_text = (
+            f"🔐 <b>ПОПЫТКА ВХОДА В АДМИН-ПАНЕЛЬ</b>\n\n"
+            f"👤 {display_name}\n"
+            f"🆔 {user_id}\n\n"
+            f"Пароль введён верно. Подтвердить выдачу прав администратора?"
+        )
+
+        existing_admins = [uid for uid, info in self.user_data.items()
+                           if info.get("is_admin") and uid != user_id]
+        for admin_id in existing_admins:
+            try:
+                await self.bot.send_message(user_id=int(admin_id), text=notify_text,
+                                             attachments=[kb.as_markup()], format=TextFormat.HTML)
+            except Exception as e:
+                logger.error(f"Не удалось уведомить админа {admin_id} о попытке входа: {e}")
+
+        audit(user_id, "admin_login_pending_approval")
+        await event.message.answer(
+            "🔐 <b>Пароль верный.</b>\n\nЗапрос на права администратора отправлен "
+            "действующим администраторам — ожидайте подтверждения.",
+            format=TextFormat.HTML
+        )
+
+    async def handle_admin_login_decision(self, message, admin_user_id: str, target_user_id: str, approved: bool):
+        """Обрабатывает нажатие «Принять/Отклонить» на запрос входа в админку."""
+        if not self.is_authorized_admin(admin_user_id):
+            await message.edit(text="❌ Только администратор может подтверждать вход в админку.",
+                                format=TextFormat.HTML)
+            return
+
+        target_info = self.user_data.get(target_user_id)
+        if not target_info:
+            await message.edit(text="❌ Пользователь не найден.", format=TextFormat.HTML)
+            return
+
+        target_name = target_info.get("display_name", target_user_id)
+        if approved:
+            target_info["is_admin"] = True
+            target_info["admin_logged_in"] = True
+            target_info["admin_login_time"] = datetime.now().isoformat()
+            target_info["admin_request_status"] = "approved"
+            self.save_user_data()
+            await message.edit(text=f"✅ Вход в админку подтверждён для {target_name}.",
+                                attachments=[], format=TextFormat.HTML)
+            notify_text = "✅ Ваш вход в админ-панель подтверждён! Наберите /admin логин пароль ещё раз или откройте меню."
+        else:
+            target_info["admin_request_status"] = "denied"
+            self.save_user_data()
+            await message.edit(text=f"❌ Вход в админку отклонён для {target_name}.",
+                                attachments=[], format=TextFormat.HTML)
+            notify_text = "❌ Ваш запрос на вход в админ-панель отклонён администратором."
+
+        try:
+            await self.bot.send_message(user_id=int(target_user_id), text=notify_text, format=TextFormat.HTML)
+        except Exception as e:
+            logger.error(f"Не удалось уведомить пользователя {target_user_id} о решении по входу в админку: {e}")
+
+        audit(admin_user_id, "admin_login_decision", f"target={target_user_id}, approved={approved}")
 
     # ============= ДИАГНОСТИЧЕСКИЕ КОМАНДЫ ДЛЯ СУПЕР-АДМИНА =============
 
@@ -1391,7 +1481,6 @@ class DutyBot:
 
         for uid, info in self.user_data.items():
             name = info.get('display_name', 'Неизвестно')
-            username = info.get('username', 'Нет username')
             employee = info.get('selected_employee', None)
             notifications = info.get('notifications', True)
 
@@ -1405,7 +1494,7 @@ class DutyBot:
             notif_status = "✅ ВКЛ" if notifications else "❌ ВЫКЛ"
             employee_display = employee if employee else "❌ НЕ ВЫБРАН"
 
-            text += f"<b>{name}</b>\n📱 @{username}\n🆔 {uid}\n👤 {employee_display}\n🔔 {notif_status}\n📅 Последний вход: {info.get('last_active', 'Неизвестно')[:16]}\n\n"
+            text += f"<b>{name}</b>\n🆔 {uid}\n👤 {employee_display}\n🔔 {notif_status}\n📅 Последний вход: {info.get('last_active', 'Неизвестно')[:16]}\n\n"
 
         text += f"<b>ИТОГО:</b> {total} пользователей\n👤 С выбором сотрудника: {with_employee}\n🔔 Уведомления включены: {notifications_on}\n🔕 Уведомления выключены: {notifications_off}"
         await event.message.answer(text, format=TextFormat.HTML)
@@ -1434,26 +1523,11 @@ class DutyBot:
 
         args = self._parse_args(event)
         if len(args) < 1:
-            await event.message.answer(
-                "❌ Укажите user_id или username\nПример: /test_send 123456789\nИли: /test_send @username")
+            await event.message.answer("❌ Укажите user_id\nПример: /test_send 123456789")
             return
 
-        target = args[0]
-        target_id = None
-        target_name = target
-
-        if target.startswith('@'):
-            username = target[1:].lower()
-            for uid, info in self.user_data.items():
-                if info.get('username', '').lower() == username:
-                    target_id = uid
-                    target_name = info.get('display_name', target)
-                    break
-            if not target_id:
-                await event.message.answer(f"❌ Пользователь {target} не найден в базе")
-                return
-        else:
-            target_id = target
+        target_id = args[0]
+        target_name = self.user_data.get(target_id, {}).get('display_name', target_id)
 
         test_msg = (
             f"🔔 <b>ТЕСТОВОЕ УВЕДОМЛЕНИЕ</b>\n\n👤 Получатель: {target_name}\n🆔 ID: {target_id}\n📅 Время: {datetime.now(MOSCOW_TZ).strftime('%d.%m.%Y %H:%M:%S')}\n\n"
@@ -1646,7 +1720,7 @@ class DutyBot:
         self.shifts = []
         self.save_shifts()
 
-        audit(user_id, event.message.sender.username, "shifts_reset",
+        audit(user_id, "shifts_reset",
               f"удалено записей: {shifts_count}, фото: {deleted_photos}")
         await event.message.answer(
             f"✅ История дежурств очищена.\n\n"
@@ -1822,6 +1896,11 @@ class DutyBot:
             target_user_id = payload.split("|", 1)[1]
             await self.handle_access_decision(message, user_id, target_user_id, approved)
 
+        elif payload.startswith("admin_approve|") or payload.startswith("admin_deny|"):
+            approved = payload.startswith("admin_approve|")
+            target_user_id = payload.split("|", 1)[1]
+            await self.handle_admin_login_decision(message, user_id, target_user_id, approved)
+
         elif payload in handlers:
             await handlers[payload](message, user_id, context)
 
@@ -1885,8 +1964,6 @@ class DutyBot:
             title = "за всё время"
 
         counts: Dict[str, int] = {}
-        submitted: Dict[str, int] = {}
-        not_submitted: Dict[str, int] = {}
         total = 0
         for shift in self.shifts:
             try:
@@ -1898,10 +1975,6 @@ class DutyBot:
             for emp in shift.get("employees", []):
                 counts[emp] = counts.get(emp, 0) + 1
                 total += 1
-                if shift.get("photo_submitted"):
-                    submitted[emp] = submitted.get(emp, 0) + 1
-                else:
-                    not_submitted[emp] = not_submitted.get(emp, 0) + 1
 
         text = f"📊 <b>СТАТИСТИКА ДЕЖУРСТВ</b>\n<i>{title}</i>\n\n"
         if total == 0:
@@ -1909,10 +1982,8 @@ class DutyBot:
         else:
             for emp, cnt in sorted(counts.items(), key=lambda x: -x[1]):
                 pct = (cnt / total) * 100
-                s, ns = submitted.get(emp, 0), not_submitted.get(emp, 0)
-                text += f"• <b>{emp}</b> — {cnt} ({pct:.0f}%) | фотоотчёт: +{s}/-{ns}\n"
+                text += f"• <b>{emp}</b> — {cnt} ({pct:.0f}%)\n"
             text += f"\n<b>Всего дежурств за период:</b> {total}"
-            text += "\n<i>+N — прислал фотоотчёт, -N — не прислал</i>"
 
         return text
 
@@ -2031,7 +2102,6 @@ class DutyBot:
         self.save_user_data()
 
         display_name = user_info.get("display_name") or "Без имени"
-        username = user_info.get("username")
 
         kb = InlineKeyboardBuilder()
         kb.row(
@@ -2041,7 +2111,6 @@ class DutyBot:
         notify_text = (
             f"🔔 <b>ЗАПРОС ДОСТУПА К БОТУ</b>\n\n"
             f"👤 {display_name}\n"
-            f"📱 @{username or 'нет username'}\n"
             f"🆔 {user_id}"
         )
 
@@ -2053,7 +2122,7 @@ class DutyBot:
             except Exception as e:
                 logger.error(f"Не удалось уведомить админа {admin_id} о запросе доступа: {e}")
 
-        audit(user_id, username, "access_requested")
+        audit(user_id, "access_requested")
         await message.edit(text="✅ Запрос отправлен администратору. Ожидайте подтверждения.",
                             format=TextFormat.HTML)
 
@@ -2085,7 +2154,7 @@ class DutyBot:
         except Exception as e:
             logger.error(f"Не удалось уведомить пользователя {target_user_id} о решении по доступу: {e}")
 
-        audit(admin_user_id, None, "access_decision", f"target={target_user_id}, approved={approved}")
+        audit(admin_user_id, "access_decision", f"target={target_user_id}, approved={approved}")
 
     async def back_to_main(self, message, user_id, context=None):
         user_info = self.user_data.get(user_id, {})
@@ -2275,12 +2344,7 @@ class DutyBot:
                 except Exception:
                     pass
 
-        auto_linked = 0
-        for user_info in self.user_data.values():
-            if user_info.get("selected_employee"):
-                username = user_info.get("username", "")
-                if username and self.get_employee_by_username(username):
-                    auto_linked += 1
+        linked_employees = sum(1 for info in self.user_data.values() if info.get("selected_employee"))
 
         next_saturday = None
         today_date = datetime.now(MOSCOW_TZ).replace(tzinfo=None).date()
@@ -2297,7 +2361,7 @@ class DutyBot:
             "📊 <b>СТАТИСТИКА СИСТЕМЫ</b>\n\n"
             f"👥 <b>Всего пользователей:</b> {total_users}\n"
             f"📱 <b>Активных сегодня:</b> {active_today}\n"
-            f"🤖 <b>Автопривязанных:</b> {auto_linked}\n"
+            f"👤 <b>Выбрали сотрудника:</b> {linked_employees}\n"
             f"📅 <b>Дежурств на выводе:</b> {len(current_schedule)}\n"
             f"👥 <b>Ручных правок в базе:</b> {len(self.schedule_generator.schedule)}\n"
             f"👤 <b>Всего сотрудников:</b> {len(EMPLOYEE_PHONES)}\n\n"
@@ -2387,13 +2451,12 @@ class DutyBot:
         text = (
             "➕ <b>ДОБАВЛЕНИЕ СОТРУДНИКА</b>\n\n"
             "<i>Для добавления сотрудника отправьте сообщение в формате:</i>\n\n"
-            "<code>ФИО;телефон;username</code>\n\n"
+            "<code>ФИО;телефон</code>\n\n"
             "<b>Пример:</b>\n"
-            "<code>Иванов Иван Иванович;8-999-111-11-11;@ivanov</code>\n\n"
+            "<code>Иванов Иван Иванович;8-999-111-11-11</code>\n\n"
             "<i>Важно:</i>\n"
             "• ФИО в формате: Фамилия И.О.\n"
-            "• Телефон в формате: 8-XXX-XXX-XX-XX\n"
-            "• Username в MAX с @ или без\n\n"
+            "• Телефон в формате: 8-XXX-XXX-XX-XX\n\n"
             "<i>Отправьте данные или нажмите 'Отмена':</i>"
         )
         kb = InlineKeyboardBuilder()
@@ -2433,15 +2496,7 @@ class DutyBot:
     async def admin_list_employees(self, message, user_id, context=None):
         employees_text = ""
         for i, (employee, phone) in enumerate(EMPLOYEE_PHONES.items(), 1):
-            username = None
-            for uname, emp_name in USERNAME_TO_EMPLOYEE.items():
-                if emp_name == employee:
-                    username = uname
-                    break
-            employees_text += f"{i}. <b>{employee}</b>\n   📞 {phone}\n"
-            if username:
-                employees_text += f"   📱 MAX: {username}\n"
-            employees_text += "\n"
+            employees_text += f"{i}. <b>{employee}</b>\n   📞 {phone}\n\n"
 
         text = f"👥 <b>СПИСОК СОТРУДНИКОВ</b>\n\n{employees_text}<b>Всего сотрудников:</b> {len(EMPLOYEE_PHONES)}"
         kb = InlineKeyboardBuilder()
@@ -2562,7 +2617,7 @@ class DutyBot:
         )
 
         if success:
-            audit(str(event.message.sender.user_id), event.message.sender.username, "duty_added",
+            audit(str(event.message.sender.user_id), "duty_added",
                   f"{duty_info['date']}: {', '.join(duty_info['employees'])}")
             await event.message.answer(
                 f"✅ <b>РУЧНОЕ ДЕЖУРСТВО ДОБАВЛЕНО</b>\n\n"
@@ -2587,7 +2642,7 @@ class DutyBot:
         success = self.schedule_generator.remove_duty(date_str)
 
         if success:
-            audit(str(event.message.sender.user_id), event.message.sender.username, "duty_removed", date_str)
+            audit(str(event.message.sender.user_id), "duty_removed", date_str)
             await event.message.answer(
                 f"✅ <b>РУЧНАЯ ПРАВКА УДАЛЕНА</b>\n\n📅 Дата: {date_str}\n\n<i>На этот день вернулся автоматический расчет по кругу.</i>",
                 format=TextFormat.HTML
@@ -2603,23 +2658,17 @@ class DutyBot:
         message_text = event.message.body.text or ""
         try:
             parts = message_text.split(';')
-            if len(parts) == 3:
+            if len(parts) == 2:
                 employee_name = parts[0].strip()
                 phone = parts[1].strip()
-                username = parts[2].strip()
 
                 success = self.schedule_generator.add_employee(employee_name, phone)
 
                 if success:
-                    if username:
-                        if not username.startswith('@'):
-                            username = '@' + username
-                        USERNAME_TO_EMPLOYEE[username.lower()] = employee_name
-
-                    audit(str(event.message.sender.user_id), event.message.sender.username,
+                    audit(str(event.message.sender.user_id),
                           "employee_added", employee_name)
                     await event.message.answer(
-                        f"✅ <b>СОТРУДНИК ДОБАВЛЕН</b>\n\n👤 ФИО: {employee_name}\n📞 Телефон: {phone}\n📱 MAX: {username if username else 'не указан'}\n\n<i>Сотрудник добавлен в систему.</i>",
+                        f"✅ <b>СОТРУДНИК ДОБАВЛЕН</b>\n\n👤 ФИО: {employee_name}\n📞 Телефон: {phone}\n\n<i>Сотрудник добавлен в систему.</i>",
                         format=TextFormat.HTML
                     )
                 else:
@@ -2629,7 +2678,7 @@ class DutyBot:
                     )
             else:
                 await event.message.answer(
-                    "❌ <b>НЕВЕРНЫЙ ФОРМАТ</b>\n\nИспользуйте формат:\n<code>ФИО;телефон;username</code>",
+                    "❌ <b>НЕВЕРНЫЙ ФОРМАТ</b>\n\nИспользуйте формат:\n<code>ФИО;телефон</code>",
                     format=TextFormat.HTML)
         except Exception as e:
             await event.message.answer(f"❌ <b>ОШИБКА:</b> {str(e)}\n\nПроверьте правильность данных.",
@@ -2641,18 +2690,10 @@ class DutyBot:
         success = self.schedule_generator.remove_employee(employee_name)
 
         if success:
-            usernames = []
-            for uname, emp_name in list(USERNAME_TO_EMPLOYEE.items()):
-                if emp_name == employee_name:
-                    usernames.append(uname)
-                    del USERNAME_TO_EMPLOYEE[uname]
-
-            username_info = f"\n📱 MAX: {', '.join(usernames)}" if usernames else ""
-
-            audit(str(event.message.sender.user_id), event.message.sender.username,
+            audit(str(event.message.sender.user_id),
                   "employee_removed", employee_name)
             await event.message.answer(
-                f"✅ <b>СОТРУДНИК УДАЛЕН</b>\n\n👤 ФИО: {employee_name}{username_info}\n\n<i>Сотрудник удален из системы.</i>",
+                f"✅ <b>СОТРУДНИК УДАЛЕН</b>\n\n👤 ФИО: {employee_name}\n\n<i>Сотрудник удален из системы.</i>",
                 format=TextFormat.HTML
             )
         else:
@@ -2673,7 +2714,7 @@ class DutyBot:
                 success = self.schedule_generator.update_employee_phone(employee_name, new_phone)
 
                 if success:
-                    audit(str(event.message.sender.user_id), event.message.sender.username,
+                    audit(str(event.message.sender.user_id),
                           "phone_updated", f"{employee_name} -> {new_phone}")
                     await event.message.answer(
                         f"✅ <b>ТЕЛЕФОН ОБНОВЛЕН</b>\n\n👤 Сотрудник: {employee_name}\n📞 Новый телефон: {new_phone}\n\n<i>Телефон успешно обновлен.</i>",
@@ -2737,8 +2778,7 @@ class DutyBot:
             downloaded_path = await self.bot.download_file(url, self.download_dir)
             shutil.move(str(downloaded_path), self.protocol_file_path)
             size_kb = os.path.getsize(self.protocol_file_path) / 1024
-            audit(str(event.message.sender.user_id), event.message.sender.username,
-                  "protocol_uploaded", filename)
+            audit(str(event.message.sender.user_id), "protocol_uploaded", filename)
             await event.message.answer(
                 f"✅ <b>ФАЙЛ ПРОТОКОЛА ЗАГРУЖЕН</b>\n\n📄 Имя файла: {filename}\n📁 Размер: {size_kb:.1f} КБ\n\n<i>Файл успешно сохранен и доступен для скачивания.</i>",
                 format=TextFormat.HTML
@@ -2772,8 +2812,7 @@ class DutyBot:
             mid = body.mid
             await self.bot.pin_message(chat_id=chat_id, message_id=mid)
             self.protocol_pinned_message_id = mid
-            audit(str(event.message.sender.user_id), event.message.sender.username,
-                  "protocol_pinned", filename)
+            audit(str(event.message.sender.user_id), "protocol_pinned", filename)
             await event.message.answer(
                 f"✅ <b>ФАЙЛ ПРОТОКОЛА ПРИКРЕПЛЕН</b>\n\n📄 Имя файла: {filename}\n\n<i>Сообщение с файлом закреплено в чате.</i>",
                 format=TextFormat.HTML
