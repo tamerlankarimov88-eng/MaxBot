@@ -165,7 +165,7 @@ RU_MONTHS_GENITIVE = {
 
 # Обновляется вручную при каждом релизе — по /time можно однозначно проверить,
 # какая версия кода реально работает на хостинге (без гадания по редеплою).
-BOT_CODE_VERSION = "2026-07-16-admin-approval-no-username"
+BOT_CODE_VERSION = "2026-07-16-bugfix-saturday-only-and-admin-auth"
 
 
 class DutyScheduleGenerator:
@@ -361,6 +361,12 @@ class DutyScheduleGenerator:
             if date_obj < today and date_str != today.strftime("%d.%m.%Yг."):
                 return False, "Дата должна быть в будущем или текущей"
 
+            if date_obj.weekday() != 5:
+                return False, (
+                    "Дежурства назначаются только на субботу. "
+                    f"{date_str_clean} — {['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье'][date_obj.weekday()]}."
+                )
+
             if not date_str.endswith("г."):
                 date_str += "г."
 
@@ -401,6 +407,23 @@ class DutyScheduleGenerator:
         global EMPLOYEE_PHONES
         if employee_name in EMPLOYEE_PHONES:
             EMPLOYEE_PHONES[employee_name] = new_phone
+
+            # Ручные дежурства (add_duty) хранят снимок телефона на момент
+            # создания — без этого смена номера не отражалась бы в уже
+            # добавленных вручную записях графика.
+            for duty in self.schedule.values():
+                for i, emp in enumerate(duty["employees"]):
+                    if emp == employee_name:
+                        duty["phones"][i] = new_phone
+            changed = False
+            for item in self.schedule_data:
+                for i, emp in enumerate(item["employees"]):
+                    if emp == employee_name:
+                        item["phones"][i] = new_phone
+                        changed = True
+            if changed:
+                self._save_overrides()
+
             logger.info(f"Обновлен телефон {employee_name}: {new_phone}")
             return True
         return False
@@ -417,6 +440,10 @@ class DutyScheduleGenerator:
         global EMPLOYEE_PHONES
         if employee_name in EMPLOYEE_PHONES:
             del EMPLOYEE_PHONES[employee_name]
+            # Иначе уволенный сотрудник продолжал бы вечно попадать в круг
+            # дежурств — ротация просто пропускает его теперь.
+            while employee_name in DUTY_ROTATION_CIRCLE:
+                DUTY_ROTATION_CIRCLE.remove(employee_name)
             logger.info(f"Удален сотрудник: {employee_name}")
             return True
         return False
@@ -898,6 +925,7 @@ class DutyBot:
             audit(str(sender.user_id), "report_photo_received", f"смена №{shift_number}")
 
             await event.message.answer("✅ Спасибо! Фотоотчёт получен.", format=TextFormat.HTML)
+            await self._finalize_shift_protocol(shift, event.message.recipient.chat_id)
         except Exception as e:
             logger.error(f"Ошибка сохранения фотоотчёта (смена №{shift_number}): {e}")
             await event.message.answer(f"❌ Ошибка сохранения фото: {str(e)[:200]}", format=TextFormat.HTML)
@@ -1801,6 +1829,20 @@ class DutyBot:
                     format=TextFormat.HTML)
             return
 
+        # Все админские экраны и мастер добавления дежурства требуют прав
+        # админа — раньше эта проверка была только у payload "admin_panel",
+        # а остальные admin_* коллбэки (и add_type_/add_e1_/add_e2_ шаги
+        # мастера) выполнялись для любого пользователя, знающего payload.
+        is_admin_only_payload = (
+            payload.startswith("admin_") or payload == "admin_add_duty"
+            or payload.startswith(("add_type_", "add_e1_", "add_e2_"))
+        )
+        if is_admin_only_payload and not self.is_authorized_admin(user_id):
+            await message.edit(
+                text="❌ <b>ДОСТУП ЗАПРЕЩЕН</b>\n\nДоступ только админам",
+                format=TextFormat.HTML)
+            return
+
         handlers = {
             "full_schedule": self.show_full_schedule,
             "my_duty": self.show_my_duty,
@@ -1966,6 +2008,8 @@ class DutyBot:
         counts: Dict[str, int] = {}
         total = 0
         for shift in self.shifts:
+            if not shift.get("completed"):
+                continue
             try:
                 shift_date = datetime.strptime(shift["date"].replace("г.", "").strip(), "%d.%m.%Y")
             except Exception:
@@ -2251,6 +2295,8 @@ class DutyBot:
         if not self.is_authorized_admin(user_id):
             await message.edit(text="❌ <b>ДОСТУП ЗАПРЕЩЕН</b>", format=TextFormat.HTML)
             return
+        if context:
+            await context.clear()
 
         text = (
             "⚙️ <b>АДМИН-ПАНЕЛЬ</b>\n\n"
@@ -2276,8 +2322,16 @@ class DutyBot:
 
     async def admin_logout(self, message, user_id, context=None):
         if user_id in self.user_data:
-            self.user_data[user_id]["is_admin"] = False
             self.user_data[user_id]["admin_logged_in"] = False
+            # Админы из ADMIN_IDS доверены конфигом навсегда — сбрасывать им
+            # is_admin нельзя, иначе /test_* команды и кнопка "Админ-панель"
+            # ломаются до перезапуска бота (см. is_authorized_admin).
+            try:
+                pre_authorized = int(user_id) in ADMIN_IDS
+            except ValueError:
+                pre_authorized = False
+            if not pre_authorized:
+                self.user_data[user_id]["is_admin"] = False
             self.save_user_data()
 
         await message.edit(
@@ -2290,6 +2344,8 @@ class DutyBot:
         await self.show_admin_schedule(message, user_id, context)
 
     async def show_admin_schedule(self, message, user_id, context=None):
+        if context:
+            await context.clear()
         text = (
             "📅 <b>УПРАВЛЕНИЕ ГРАФИКОМ ДЕЖУРСТВ</b>\n\n"
             "Доступные действия:\n\n"
@@ -2302,6 +2358,8 @@ class DutyBot:
         await message.edit(text=text, attachments=[self.get_schedule_admin_keyboard()], format=TextFormat.HTML)
 
     async def show_admin_employees(self, message, user_id, context=None):
+        if context:
+            await context.clear()
         text = (
             "👥 <b>УПРАВЛЕНИЕ СОТРУДНИКАМИ</b>\n\n"
             "Доступные действия:\n\n"
@@ -2314,6 +2372,8 @@ class DutyBot:
         await message.edit(text=text, attachments=[self.get_employees_admin_keyboard()], format=TextFormat.HTML)
 
     async def show_admin_files(self, message, user_id, context=None):
+        if context:
+            await context.clear()
         protocol_exists = os.path.exists(self.protocol_file_path)
         text = (
             "📁 <b>УПРАВЛЕНИЕ ФАЙЛАМИ</b>\n\n"
@@ -2583,6 +2643,22 @@ class DutyBot:
 
     async def wizard_wait_date(self, event: MessageCreated, context: BaseContext):
         message_text = event.message.body.text or ""
+        try:
+            date_obj = datetime.strptime(message_text.replace("г.", "").strip(), "%d.%m.%Y")
+        except ValueError:
+            await event.message.answer(
+                "❌ <b>Неверный формат даты</b>\n\nВведите в формате дд.мм.гггг, например: 07.02.2026",
+                format=TextFormat.HTML
+            )
+            return
+        if date_obj.weekday() != 5:
+            weekday_name = ['понедельник', 'вторник', 'среда', 'четверг', 'пятница', 'суббота', 'воскресенье'][date_obj.weekday()]
+            await event.message.answer(
+                f"❌ <b>Дежурства назначаются только на субботу</b>\n\n{message_text} — {weekday_name}. Введите дату субботы:",
+                format=TextFormat.HTML
+            )
+            return
+
         data = await context.get_data()
         duty = data.get("new_duty", {"is_pair": False, "employees": [], "phones": []})
         duty["date"] = message_text if "г." in message_text else message_text + "г."
@@ -2690,6 +2766,11 @@ class DutyBot:
         success = self.schedule_generator.remove_employee(employee_name)
 
         if success:
+            for info in self.user_data.values():
+                if info.get("selected_employee") == employee_name:
+                    info["selected_employee"] = None
+            self.save_user_data()
+
             audit(str(event.message.sender.user_id),
                   "employee_removed", employee_name)
             await event.message.answer(
