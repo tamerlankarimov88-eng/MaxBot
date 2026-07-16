@@ -16,7 +16,7 @@
     }
   ],
   "admin_ids": [123456789],
-  "whitelist_mode": false,
+  "whitelist_mode": true,
   "survey": {
     "send_hour": 8,
     "send_minute": 0,
