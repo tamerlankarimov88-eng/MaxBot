@@ -717,16 +717,15 @@ class DutyBot:
             id='duty_report_request',
             replace_existing=True
         )
-        self.scheduler.add_job(
-            self.send_protocol_template_reminder,
-            CronTrigger(day_of_week='thu', hour=15, minute=0, second=0, timezone=MOSCOW_TZ),
-            id='protocol_template_reminder',
-            replace_existing=True
-        )
+        # Автоматическая рассылка бланка протокола по четвергам отключена —
+        # теперь бланк не присылается сам, а скачивается по кнопке «📄 Скачать
+        # протокол» в главном меню (см. download_protocol), сразу заполненный
+        # датой ближайшего дежурства. send_protocol_template_reminder оставлен
+        # только для ручного вызова через /test_protocol_reminder.
 
         self.scheduler.start()
         logger.info(
-            f"Планировщик задач запущен: среда 18:00, четверг 15:00 (бланк протокола), "
+            f"Планировщик задач запущен: среда 18:00, "
             f"пятница 18:00, суббота {SURVEY_CONFIG.get('send_hour', 8):02d}:{SURVEY_CONFIG.get('send_minute', 0):02d} "
             f"(фотоотчёт), суббота 10:00"
         )
@@ -2459,15 +2458,32 @@ class DutyBot:
         await message.edit(text=text, attachments=[self.get_main_keyboard(user_id)], format=TextFormat.HTML)
 
     async def download_protocol(self, message, user_id, context=None):
+        """«📄 Скачать протокол» — генерирует пустой бланк protocol_template.docx,
+        сразу заполненный датой ближайшего предстоящего дежурства, вместо
+        того чтобы ждать проактивной рассылки по четвергам (той больше нет)."""
         try:
-            if not os.path.exists(self.protocol_file_path):
-                await message.edit(text="❌ Файл не найден", attachments=[self.get_back_keyboard()],
+            if not PROTOCOL_TEMPLATE_PATH.exists():
+                await message.edit(text="❌ Шаблон протокола не найден", attachments=[self.get_back_keyboard()],
                                     format=TextFormat.HTML)
                 return
 
+            current_schedule = self.schedule_generator._generate_dynamic_schedule()
+            if not current_schedule:
+                await message.edit(text="❌ В графике нет предстоящих дежурств", attachments=[self.get_back_keyboard()],
+                                    format=TextFormat.HTML)
+                return
+
+            upcoming = min(current_schedule.values(), key=lambda d: d["date_obj"])
+            date_str = upcoming["date_obj"].strftime("%d.%m.%Yг.")
+
+            self.protocol_dir.mkdir(exist_ok=True)
+            date_compact = date_str.replace("г.", "").replace(".", "-")
+            file_path = self.protocol_dir / f"Протокол Разногласий_{date_compact}.docx"
+            self._fill_protocol_template({"date": date_str}, file_path)
+
             await message.reply(
-                text="📄 Протокол разногласий",
-                attachments=[InputMedia(path=self.protocol_file_path)],
+                text=f"📄 Протокол разногласий на {date_str}",
+                attachments=[InputMedia(path=str(file_path))],
             )
             await message.edit(text="✅ Файл отправлен", attachments=[self.get_back_keyboard()],
                                 format=TextFormat.HTML)
