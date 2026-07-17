@@ -94,6 +94,38 @@ def _load_config() -> dict:
         return json.load(f)
 
 
+def _save_employee_config():
+    """Пишет текущие EMPLOYEE_PHONES/DUTY_ROTATION_CIRCLE обратно в config.json.
+
+    Без этого add_employee/remove_employee/update_employee_phone меняли бы
+    только переменные в памяти процесса — после рестарта бота (редеплой,
+    краш, ручной перезапуск) уволенный сотрудник тихо возвращался бы в круг
+    дежурств, а добавленный/изменённый — пропадал.
+
+    На хостинге без файловой системы (переменная окружения CONFIG_JSON вместо
+    config.json) сохранять управляющему процессу некуда — своя же переменная
+    окружения недоступна на запись. В этом режиме поведение как раньше: только
+    в памяти, до следующего рестарта нужно обновить CONFIG_JSON вручную."""
+    if os.environ.get("CONFIG_JSON"):
+        logger.warning(
+            "Изменения сотрудников не сохранены — бот запущен через CONFIG_JSON "
+            "(нет файла config.json для записи). Обновите переменную CONFIG_JSON "
+            "на хостинге вручную, иначе после рестарта изменения потеряются."
+        )
+        return
+    if not CONFIG_PATH.exists():
+        return
+    try:
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        config["employee_phones"] = EMPLOYEE_PHONES
+        config["duty_rotation_circle"] = DUTY_ROTATION_CIRCLE
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Не удалось сохранить изменения сотрудников в {CONFIG_PATH}: {e}")
+
+
 _config = _load_config()
 
 # Админ-аккаунт
@@ -466,6 +498,7 @@ class DutyScheduleGenerator:
             if changed:
                 self._save_overrides()
 
+            _save_employee_config()
             logger.info(f"Обновлен телефон {employee_name}: {new_phone}")
             return True
         return False
@@ -474,6 +507,7 @@ class DutyScheduleGenerator:
         global EMPLOYEE_PHONES
         if employee_name not in EMPLOYEE_PHONES:
             EMPLOYEE_PHONES[employee_name] = phone
+            _save_employee_config()
             logger.info(f"Добавлен сотрудник: {employee_name} - {phone}")
             return True
         return False
@@ -491,6 +525,7 @@ class DutyScheduleGenerator:
 
         affected_dates = self._remove_employee_from_overrides(employee_name)
 
+        _save_employee_config()
         logger.info(f"Удален сотрудник: {employee_name}")
         return True, affected_dates
 
