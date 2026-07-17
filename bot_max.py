@@ -630,8 +630,10 @@ class ProtocolCleanupMiddleware(BaseMiddleware):
             pending_mid = self.duty_bot.user_data.get(user_id, {}).pop("pending_protocol_mid", None)
             if pending_mid:
                 self.duty_bot.save_user_data()
+                logger.info(f"Автоудаление протокола: пробую удалить mid={pending_mid} для user_id={user_id}")
                 try:
                     await self.duty_bot.bot.delete_message(message_id=pending_mid)
+                    logger.info(f"Автоудаление протокола: mid={pending_mid} удалён успешно")
                 except Exception as e:
                     logger.error(f"Не удалось удалить старое сообщение с протоколом ({pending_mid}): {e}")
         return await handler(event_object, data)
@@ -2536,6 +2538,12 @@ class DutyBot:
                 # (см. ProtocolCleanupMiddleware).
                 self.user_data[user_id]["pending_protocol_mid"] = mid
                 self.save_user_data()
+                logger.info(f"Протокол отправлен user_id={user_id}, mid={mid} запомнен для автоудаления")
+            else:
+                logger.warning(
+                    f"Протокол отправлен user_id={user_id}, но mid не удалось получить из ответа "
+                    f"(sent={sent!r}) — автоудаление для этого файла не сработает"
+                )
 
             await message.edit(text="✅ Файл отправлен", attachments=[self.get_back_keyboard()],
                                 format=TextFormat.HTML)
