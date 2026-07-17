@@ -1322,9 +1322,11 @@ class DutyBot:
                 "<i>Чтобы привязать аккаунт к вашему профилю, введите в чат "
                 "последние 4 цифры вашего номера телефона.</i>"
             )
-            builder = InlineKeyboardBuilder()
-            builder.row(CallbackButton(text="📋 Выбрать ФИО из списка", payload="link_by_list"))
-            keyboard = builder.as_markup()
+            keyboard = None
+            if self.is_authorized_admin(user_id):
+                builder = InlineKeyboardBuilder()
+                builder.row(CallbackButton(text="📋 Выбрать ФИО из списка", payload="link_by_list"))
+                keyboard = builder.as_markup()
             context = self.dp.fsm.get_context(chat_id=chat_id, user_id=int(user_id))
             await context.set_state(LinkWizard.awaiting_phone_digits)
 
@@ -1845,9 +1847,13 @@ class DutyBot:
         # админа — раньше эта проверка была только у payload "admin_panel",
         # а остальные admin_* коллбэки (и add_type_/add_e1_/add_e2_ шаги
         # мастера) выполнялись для любого пользователя, знающего payload.
+        # emp_/link_by_list — ручной выбор ФИО из списка, обход привязки по
+        # телефону. Открыт для всех, это дыра в минимальной защите (любой мог
+        # привязаться к чужому имени без знания номера) — теперь только админ.
         is_admin_only_payload = (
             payload.startswith("admin_") or payload == "admin_add_duty"
             or payload.startswith(("add_type_", "add_e1_", "add_e2_"))
+            or payload.startswith("emp_") or payload == "link_by_list"
         )
         if is_admin_only_payload and not self.is_authorized_admin(user_id):
             await message.edit(
@@ -2291,9 +2297,12 @@ class DutyBot:
             "Введите в чат последние 4 цифры вашего номера телефона, чтобы "
             "перепривязать аккаунт.\n\n<i>Текущий выбор будет заменен.</i>"
         )
-        builder = InlineKeyboardBuilder()
-        builder.row(CallbackButton(text="📋 Выбрать ФИО из списка", payload="link_by_list"))
-        await message.edit(text=text, attachments=[builder.as_markup()], format=TextFormat.HTML)
+        attachments = []
+        if self.is_authorized_admin(user_id):
+            builder = InlineKeyboardBuilder()
+            builder.row(CallbackButton(text="📋 Выбрать ФИО из списка", payload="link_by_list"))
+            attachments = [builder.as_markup()]
+        await message.edit(text=text, attachments=attachments, format=TextFormat.HTML)
         fsm_context = self.dp.fsm.get_context(chat_id=message.recipient.chat_id, user_id=int(user_id))
         await fsm_context.set_state(LinkWizard.awaiting_phone_digits)
 
@@ -2351,13 +2360,16 @@ class DutyBot:
                 format=TextFormat.HTML
             )
         elif not matches:
-            builder = InlineKeyboardBuilder()
-            builder.row(CallbackButton(text="📋 Выбрать ФИО из списка", payload="link_by_list"))
+            attachments = []
+            hint = "Проверьте цифры и попробуйте снова."
+            if self.is_authorized_admin(user_id):
+                builder = InlineKeyboardBuilder()
+                builder.row(CallbackButton(text="📋 Выбрать ФИО из списка", payload="link_by_list"))
+                attachments = [builder.as_markup()]
+                hint = "Проверьте цифры и попробуйте снова, либо выберите ФИО из списка."
             await event.message.answer(
-                "❌ <b>НЕ НАЙДЕНО</b>\n\n"
-                "Сотрудник с таким номером не найден. Проверьте цифры и "
-                "попробуйте снова, либо выберите ФИО из списка.",
-                attachments=[builder.as_markup()],
+                f"❌ <b>НЕ НАЙДЕНО</b>\n\nСотрудник с таким номером не найден. {hint}",
+                attachments=attachments,
                 format=TextFormat.HTML
             )
         else:
