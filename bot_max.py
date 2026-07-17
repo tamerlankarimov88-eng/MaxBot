@@ -2125,6 +2125,7 @@ class DutyBot:
             await context.set_state(AdminWizard.wait_date)
             await message.edit(
                 text="📅 <b>Шаг 2:</b> Введите дату в чат\n\nФормат: <code>дд.мм.гггг</code>\n<i>Например: 07.02.2026</i>",
+                attachments=[],
                 format=TextFormat.HTML
             )
 
@@ -2145,6 +2146,7 @@ class DutyBot:
                 await context.set_state(AdminWizard.wait_phones)
                 await message.edit(
                     text=f"✅ Выбран: <b>{name}</b>\n\n📞 <b>Шаг 4:</b> Введите номер телефона в чат.\n\n<i>Лайфхак: Напишите в чат слово <b>ок</b>, и бот сам подставит сохраненный номер сотрудника!</i>",
+                    attachments=[],
                     format=TextFormat.HTML
                 )
 
@@ -2158,6 +2160,7 @@ class DutyBot:
             await message.edit(
                 text=(f"✅ Выбрана пара: <b>{duty['employees'][0]} + {name}</b>\n\n"
                       "📞 <b>Шаг 5:</b> Введите телефоны через запятую.\n\n<i>Лайфхак: Напишите в чат слово <b>ок</b>, и бот сам подставит номера обоих сотрудников!</i>"),
+                attachments=[],
                 format=TextFormat.HTML
             )
 
