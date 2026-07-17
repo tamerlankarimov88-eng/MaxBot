@@ -15,6 +15,12 @@
       "is_pair": false
     }
   ],
+  "historical_shifts": [
+    {
+      "date": "01.01.2026",
+      "employees": ["Фамилия И.О."]
+    }
+  ],
   "admin_ids": [123456789],
   "whitelist_mode": true,
   "survey": {

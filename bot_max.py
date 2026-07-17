@@ -161,6 +161,16 @@ for _item in _config.get("duty_schedule", []):
         "is_pair": _item.get("is_pair", False),
     })
 
+# Исторические дежурства (задним числом, для статистики "За год") — читаются
+# из config.json/CONFIG_JSON, ключ "historical_shifts": [{"date": ..., "employees": [...]}].
+# Хранить их только в shifts_history.json недостаточно: на хостинге без
+# постоянного диска (CONFIG_JSON вместо файла) этот файл не переживает
+# рестарт, а конфиг — переживает.
+HISTORICAL_SHIFTS: List[Dict] = []
+for _item in _config.get("historical_shifts", []):
+    _date_str = _item["date"] if _item["date"].endswith("г.") else _item["date"] + "г."
+    HISTORICAL_SHIFTS.append({"date": _date_str, "employees": _item["employees"]})
+
 # user_id администраторов, которым при первом запуске бота автоматически
 # выдаются права админа (ТЗ п.3, "Безопасность": проверка по списку ADMIN_IDS).
 # Основной способ входа в админку — по-прежнему /admin логин пароль;
@@ -1353,8 +1363,9 @@ class DutyBot:
 
         Каждая запись: {shift_number, date (дд.мм.гггг), employees,
         photo_submitted, photo_path, protocol_file, completed}.
-        Статистика считается только по сменам, начиная с включения этой фичи —
-        задним числом прошлые дежурства бот не восстанавливает."""
+        Смены с фотоотчётом добавляются ботом сам по себе; исторические
+        (задним числом) подмешиваются из HISTORICAL_SHIFTS — см.
+        _seed_historical_shifts."""
         if os.path.exists(self.shifts_file):
             try:
                 with open(self.shifts_file, 'r', encoding='utf-8') as f:
@@ -1364,6 +1375,36 @@ class DutyBot:
                 self.shifts = []
         else:
             self.shifts = []
+
+        self._seed_historical_shifts()
+
+    def _seed_historical_shifts(self):
+        """Подмешивает HISTORICAL_SHIFTS (задним числом, из конфига) в
+        self.shifts — по одной записи на дату, без фото и без дублей при
+        повторных запусках (сверяет по дате, не трогает уже существующие)."""
+        if not HISTORICAL_SHIFTS:
+            return
+        existing_dates = {s["date"] for s in self.shifts}
+        next_number = max((s.get("shift_number", 0) for s in self.shifts), default=0) + 1
+        added = False
+        for item in HISTORICAL_SHIFTS:
+            if item["date"] in existing_dates:
+                continue
+            self.shifts.append({
+                "shift_number": next_number,
+                "date": item["date"],
+                "employees": item["employees"],
+                "photo_submitted": False,
+                "photo_path": None,
+                "protocol_file": None,
+                "completed": True,
+            })
+            existing_dates.add(item["date"])
+            next_number += 1
+            added = True
+        if added:
+            self.save_shifts()
+            logger.info(f"Подмешано {len(HISTORICAL_SHIFTS)} исторических дежурств из конфига")
 
     def save_shifts(self):
         try:
@@ -2297,8 +2338,8 @@ class DutyBot:
         await message.edit(text=text, attachments=[kb.as_markup()], format=TextFormat.HTML)
 
     # ================= СТАТИСТИКА ДЕЖУРСТВ (ТЗ п.2.1) =================
-    # Доступна всем участникам без ограничений по ролям. Считает только смены,
-    # завершённые ПОСЛЕ включения этой функции — прошлых дежурств бот не знает.
+    # Доступна всем участникам без ограничений по ролям. Считает смены с
+    # фотоотчётом плюс подмешанные задним числом HISTORICAL_SHIFTS из конфига.
 
     def _build_stats_text(self, period: str) -> str:
         now = datetime.now(MOSCOW_TZ).replace(tzinfo=None)
@@ -2309,8 +2350,8 @@ class DutyBot:
             since = now - timedelta(days=30)
             title = "за последний месяц"
         else:
-            since = None
-            title = "за всё время"
+            since = now - timedelta(days=365)
+            title = "за год"
 
         counts: Dict[str, int] = {}
         total = 0
@@ -2329,7 +2370,7 @@ class DutyBot:
 
         text = f"📊 <b>СТАТИСТИКА ДЕЖУРСТВ</b>\n<i>{title}</i>\n\n"
         if total == 0:
-            text += "Нет завершённых дежурств за этот период.\n\n<i>Учёт ведётся с момента подключения этой функции.</i>"
+            text += "Нет завершённых дежурств за этот период."
         else:
             for emp, cnt in sorted(counts.items(), key=lambda x: -x[1]):
                 pct = (cnt / total) * 100
@@ -2343,7 +2384,7 @@ class DutyBot:
         kb.row(
             CallbackButton(text="Неделя", payload="stats_week"),
             CallbackButton(text="Месяц", payload="stats_month"),
-            CallbackButton(text="Всё время", payload="stats_all"),
+            CallbackButton(text="За год", payload="stats_all"),
         )
         kb.row(CallbackButton(text="🔙 Назад", payload="back_to_main"))
         return kb.as_markup()
