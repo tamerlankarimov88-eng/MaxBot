@@ -512,17 +512,91 @@ class DutyScheduleGenerator:
         if employee_name not in EMPLOYEE_PHONES:
             return False, []
 
+        frozen_dates = self._freeze_rotation_before_removal(employee_name)
+
         del EMPLOYEE_PHONES[employee_name]
         # Иначе уволенный сотрудник продолжал бы вечно попадать в круг
-        # дежурств — ротация просто пропускает его теперь.
+        # дежурств — ротация просто пропускает его теперь. Даты в видимом
+        # окне уже заморожены выше (_freeze_rotation_before_removal), так что
+        # это укорачивание больше не задевает ничьи существующие даты.
         while employee_name in DUTY_ROTATION_CIRCLE:
             DUTY_ROTATION_CIRCLE.remove(employee_name)
 
         affected_dates = self._remove_employee_from_overrides(employee_name)
+        if frozen_dates:
+            self._save_overrides()
 
         _save_employee_config()
         logger.info(f"Удален сотрудник: {employee_name}")
-        return True, affected_dates
+        return True, sorted(set(affected_dates) | set(frozen_dates))
+
+    def _freeze_date_override(self, date_str: str, duty: Dict):
+        self.schedule[date_str] = {
+            "employees": duty["employees"],
+            "phones": duty["phones"],
+            "is_pair": duty["is_pair"],
+            "date_obj": duty["date_obj"]
+        }
+        self.schedule_data = [d for d in self.schedule_data if d["date"] != date_str]
+        self.schedule_data.append({
+            "date": date_str,
+            "date_obj": duty["date_obj"],
+            "employees": duty["employees"],
+            "phones": duty["phones"],
+            "is_pair": duty["is_pair"]
+        })
+
+    def _freeze_rotation_before_removal(self, employee_name: str) -> List[str]:
+        """Замораживает видимое окно графика ручными правками ПЕРЕД тем, как
+        сотрудник уходит из круга — иначе укорачивание круга пересчитывает
+        ВСЕ даты окна по новому модулю (меняются даже те, что идут раньше
+        дежурства уволенного и вообще не должны трогаться).
+
+        Ожидаемое поведение: даты до его дежурства не меняются; начиная с
+        его даты — каждый сдвигается на одну позицию вперёд по исходному
+        кругу (как будто его просто вычеркнули из очереди), а не
+        пересчитывается заново по короткому кругу."""
+        if employee_name not in DUTY_ROTATION_CIRCLE:
+            return []
+        if len(set(DUTY_ROTATION_CIRCLE)) <= 1:
+            return []  # больше некого поставить на его место — замораживать нечего
+
+        old_circle = list(DUTY_ROTATION_CIRCLE)
+        old_schedule = self._generate_dynamic_schedule()
+        sorted_dates = sorted(old_schedule.items(), key=lambda x: x[1]["date_obj"])
+
+        her_index = next(
+            (i for i, (_, duty) in enumerate(sorted_dates) if employee_name in duty["employees"]),
+            None
+        )
+        if her_index is None:
+            return []  # его дежурство не попадает в видимое окно — сдвигать нечего
+
+        frozen = []
+
+        # Даты до его дежурства — замораживаем как есть, без изменений.
+        for date_str, duty in sorted_dates[:her_index]:
+            self._freeze_date_override(date_str, duty)
+            frozen.append(date_str)
+
+        # С его даты и до конца окна — идём по исходному кругу дальше от его
+        # позиции, пропуская его самого, пока не заполним весь хвост окна.
+        walk_pos = old_circle.index(employee_name)
+        for date_str, duty in sorted_dates[her_index:]:
+            while True:
+                walk_pos = (walk_pos + 1) % len(old_circle)
+                candidate = old_circle[walk_pos]
+                if candidate != employee_name:
+                    break
+            self._freeze_date_override(date_str, {
+                "employees": [candidate],
+                "phones": [EMPLOYEE_PHONES.get(candidate, "не указан")],
+                "is_pair": False,
+                "date_obj": duty["date_obj"]
+            })
+            frozen.append(date_str)
+
+        return frozen
 
     def _remove_employee_from_overrides(self, employee_name: str) -> List[str]:
         """Чистит ручные правки графика (add_duty/swap_duties) от уволенного
@@ -3234,9 +3308,14 @@ class DutyBot:
             audit(str(event.message.sender.user_id),
                   "employee_removed", f"{employee_name}; график скорректирован: {', '.join(affected_dates) or '—'}")
 
+            dates_preview = ', '.join(d.replace('г.', '') for d in affected_dates[:6])
+            if len(affected_dates) > 6:
+                dates_preview += f" и ещё {len(affected_dates) - 6}"
             schedule_note = (
-                f"\n\n📅 <b>Скорректирован график на:</b> {', '.join(d.replace('г.', '') for d in affected_dates)}\n"
-                "<i>Даты с парным дежурством оставлены на втором дежурном, остальные вернулись к авто-кругу.</i>"
+                f"\n\n📅 <b>Скорректирован график на:</b> {dates_preview}\n"
+                "<i>Даты до его/её ближайшего дежурства не менялись; начиная с этой даты "
+                "каждый сдвинут на позицию вперёд по кругу — как будто уволенного просто "
+                "вычеркнули из очереди.</i>"
                 if affected_dates else ""
             )
             await event.message.answer(
