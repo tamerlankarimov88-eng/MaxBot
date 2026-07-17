@@ -42,6 +42,7 @@ from maxapi.types.input_media import InputMedia
 from maxapi.types.updates.bot_started import BotStarted
 from maxapi.types.updates.message_callback import MessageCallback
 from maxapi.types.updates.message_created import MessageCreated
+from maxapi.filters.middleware import BaseMiddleware
 from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
 
 # Настройка логирования
@@ -597,6 +598,45 @@ class LinkWizard(StatesGroup):
     awaiting_phone_digits = State()
 
 
+class ProtocolCleanupMiddleware(BaseMiddleware):
+    """Удаляет предыдущий файл протокола, отправленный кнопкой «📄 Скачать
+    протокол» (см. DutyBot.download_protocol), как только пользователь
+    совершает любое следующее действие — иначе файлы копятся и захламляют
+    переписку с ботом."""
+
+    def __init__(self, duty_bot: "DutyBot"):
+        self.duty_bot = duty_bot
+
+    @staticmethod
+    def _extract_user_id(event_object) -> Optional[str]:
+        message = getattr(event_object, "message", None)
+        if message is not None:
+            sender = getattr(message, "sender", None)
+            if sender is not None:
+                return str(sender.user_id)
+        callback = getattr(event_object, "callback", None)
+        if callback is not None:
+            user = getattr(callback, "user", None)
+            if user is not None:
+                return str(user.user_id)
+        user = getattr(event_object, "user", None)
+        if user is not None:
+            return str(user.user_id)
+        return None
+
+    async def __call__(self, handler, event_object, data):
+        user_id = self._extract_user_id(event_object)
+        if user_id:
+            pending_mid = self.duty_bot.user_data.get(user_id, {}).pop("pending_protocol_mid", None)
+            if pending_mid:
+                self.duty_bot.save_user_data()
+                try:
+                    await self.duty_bot.bot.delete_message(message_id=pending_mid)
+                except Exception as e:
+                    logger.error(f"Не удалось удалить старое сообщение с протоколом ({pending_mid}): {e}")
+        return await handler(event_object, data)
+
+
 class DutyBot:
     def __init__(self, token: Optional[str] = None):
         # Bot() без аргумента сам читает токен из переменной окружения MAX_BOT_TOKEN
@@ -616,6 +656,7 @@ class DutyBot:
         self.load_shifts()
         self._seed_admin_ids()
         self._register_handlers()
+        self.dp.register_outer_middleware(ProtocolCleanupMiddleware(self))
 
     def _seed_admin_ids(self):
         """Пользователи из ADMIN_IDS (config.json) получают права админа
@@ -2481,10 +2522,18 @@ class DutyBot:
             file_path = self.protocol_dir / f"Протокол Разногласий_{date_compact}.docx"
             self._fill_protocol_template({"date": date_str}, file_path)
 
-            await message.reply(
+            sent = await message.reply(
                 text=f"📄 Протокол разногласий на {date_str}",
                 attachments=[InputMedia(path=str(file_path))],
             )
+            mid = sent.message.body.mid if sent and sent.message and sent.message.body else None
+            if mid and user_id in self.user_data:
+                # Захламляет переписку при повторных скачиваниях — файл
+                # удаляется автоматически при следующем действии пользователя
+                # (см. ProtocolCleanupMiddleware).
+                self.user_data[user_id]["pending_protocol_mid"] = mid
+                self.save_user_data()
+
             await message.edit(text="✅ Файл отправлен", attachments=[self.get_back_keyboard()],
                                 format=TextFormat.HTML)
         except Exception as e:
