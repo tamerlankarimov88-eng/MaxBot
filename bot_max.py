@@ -171,16 +171,10 @@ ADMIN_IDS = [int(x) for x in _config.get("admin_ids", [])]
 # заблокировать случайно всю команду при первом деплое — включается явно.
 WHITELIST_MODE = bool(_config.get("whitelist_mode", False))
 
-# Настройки опроса по итогам дежурства (ТЗ п.2.2)
-SURVEY_CONFIG = _config.get("survey", {
-    "send_hour": 8,
-    "send_minute": 0,
-    "questions": {
-        "quality": {"text": "Как прошло дежурство?", "options": ["Отлично", "Хорошо", "Были сложности", "Плохо"]},
-        "incidents": {"text": "Были ли инциденты?", "options": ["Да", "Нет"]},
-        "zgd": {"text": "Были ли ЗГД?", "options": ["Да", "Нет"]},
-    }
-})
+# Время запроса фотоотчёта по итогам дежурства (ТЗ п.2.2). Текстовый опрос
+# с вопросами про инциденты/ЗГД заменён на фотоотчёт — их текст (был раньше
+# в этом же конфиге) больше нигде не используется.
+SURVEY_CONFIG = _config.get("survey", {"send_hour": 8, "send_minute": 0})
 
 # Маска имени файла автопротокола (ТЗ п.2.5)
 PROTOCOL_FILENAME_MASK = _config.get(
