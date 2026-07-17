@@ -466,6 +466,11 @@ class ReportWizard(StatesGroup):
     awaiting_photo = State()
 
 
+class LinkWizard(StatesGroup):
+    """Ожидание последних цифр номера телефона для самостоятельной привязки аккаунта к сотруднику."""
+    awaiting_phone_digits = State()
+
+
 class DutyBot:
     def __init__(self, token: Optional[str] = None):
         # Bot() без аргумента сам читает токен из переменной окружения MAX_BOT_TOKEN
@@ -546,6 +551,7 @@ class DutyBot:
         dp.message_created(AdminWizard.awaiting_protocol_upload)(self.wizard_protocol_upload)
         dp.message_created(AdminWizard.awaiting_protocol_pin)(self.wizard_protocol_pin)
         dp.message_created(ReportWizard.awaiting_photo)(self.wizard_report_photo)
+        dp.message_created(LinkWizard.awaiting_phone_digits)(self.wizard_link_by_phone)
 
         # Файл прислан без активного состояния мастера — подскажем, что делать
         # (должно идти раньше общего текстового фолбэка)
@@ -1250,14 +1256,15 @@ class DutyBot:
         parts = text.split()
         return parts[1:] if len(parts) > 1 else []
 
-    def _register_user_and_build_welcome(self, user_id: str,
-                                          first_name: Optional[str], last_name: Optional[str]):
+    async def _register_user_and_build_welcome(self, user_id: str, chat_id: int,
+                                                 first_name: Optional[str], last_name: Optional[str]):
         """Регистрирует пользователя (если это первый заход) и собирает текст+клавиатуру
         приветственного меню. Используется и командой /start, и авто-показом меню при
         открытии чата с ботом (BotStarted) — единая точка правды для обоих путей.
 
-        Username нигде не хранится и не используется — привязка к сотруднику
-        только вручную, через выбор ФИО из списка."""
+        Username нигде не хранится и не используется — привязка к сотруднику происходит
+        по последним цифрам номера телефона (см. wizard_link_by_phone), с ручным выбором
+        ФИО из списка как запасным вариантом."""
         if user_id not in self.user_data:
             self.user_data[user_id] = {
                 "first_name": first_name,
@@ -1312,17 +1319,22 @@ class DutyBot:
             welcome_text = (
                 f"<b>ДОБРО ПОЖАЛОВАТЬ, {first_name}!</b>\n\n"
                 "Я бот для управления графиком дежурств.\n\n"
-                "<i>Пожалуйста, выберите ваше ФИО из списка:</i>"
+                "<i>Чтобы привязать аккаунт к вашему профилю, введите в чат "
+                "последние 4 цифры вашего номера телефона.</i>"
             )
-            keyboard = self.get_employee_selection_keyboard(prefix="emp_")
+            builder = InlineKeyboardBuilder()
+            builder.row(CallbackButton(text="📋 Выбрать ФИО из списка", payload="link_by_list"))
+            keyboard = builder.as_markup()
+            context = self.dp.fsm.get_context(chat_id=chat_id, user_id=int(user_id))
+            await context.set_state(LinkWizard.awaiting_phone_digits)
 
         return welcome_text, keyboard
 
     async def start(self, event: MessageCreated):
         sender = event.message.sender
         user_id = str(sender.user_id)
-        welcome_text, keyboard = self._register_user_and_build_welcome(
-            user_id, sender.first_name, sender.last_name
+        welcome_text, keyboard = await self._register_user_and_build_welcome(
+            user_id, event.message.recipient.chat_id, sender.first_name, sender.last_name
         )
         await event.message.answer(
             welcome_text,
@@ -1335,8 +1347,8 @@ class DutyBot:
         аналог 'кнопки меню': показываем меню сразу, без ожидания команды /start."""
         user = event.user
         user_id = str(user.user_id)
-        welcome_text, keyboard = self._register_user_and_build_welcome(
-            user_id, user.first_name, user.last_name
+        welcome_text, keyboard = await self._register_user_and_build_welcome(
+            user_id, event.chat_id, user.first_name, user.last_name
         )
         await self.bot.send_message(
             user_id=user.user_id,
@@ -1872,10 +1884,15 @@ class DutyBot:
             "stats_month": self.show_stats_month,
             "stats_all": self.show_stats_all,
             "request_access": self.request_access,
+            "link_by_list": self.show_employee_list_for_linking,
         }
 
         if payload.startswith("emp_"):
             employee_name = payload[4:]
+            # На случай, если пользователь пришёл сюда из флоу привязки по телефону
+            # (LinkWizard.awaiting_phone_digits ещё активен) — иначе следующий же
+            # текст этого пользователя ошибочно уйдёт в wizard_link_by_phone.
+            await context.clear()
             await self.register_employee(message, user_id, employee_name)
 
         elif payload == "admin_add_duty":
@@ -2269,9 +2286,86 @@ class DutyBot:
         await message.edit(text=text, attachments=[self.get_back_keyboard()], format=TextFormat.HTML)
 
     async def change_profile(self, message, user_id, context=None):
-        text = "<b>👤 ИЗМЕНЕНИЕ ПРОФИЛЯ</b>\n\nВыберите ваше ФИО из списка сотрудников.\n\n<i>Текущий выбор будет заменен.</i>"
+        text = (
+            "<b>👤 ИЗМЕНЕНИЕ ПРОФИЛЯ</b>\n\n"
+            "Введите в чат последние 4 цифры вашего номера телефона, чтобы "
+            "перепривязать аккаунт.\n\n<i>Текущий выбор будет заменен.</i>"
+        )
+        builder = InlineKeyboardBuilder()
+        builder.row(CallbackButton(text="📋 Выбрать ФИО из списка", payload="link_by_list"))
+        await message.edit(text=text, attachments=[builder.as_markup()], format=TextFormat.HTML)
+        fsm_context = self.dp.fsm.get_context(chat_id=message.recipient.chat_id, user_id=int(user_id))
+        await fsm_context.set_state(LinkWizard.awaiting_phone_digits)
+
+    async def show_employee_list_for_linking(self, message, user_id, context=None):
+        """Запасной вариант привязки — ручной выбор ФИО из списка (payload 'link_by_list')."""
+        if context:
+            await context.clear()
+        text = "<b>👤 ПРИВЯЗКА АККАУНТА</b>\n\nВыберите ваше ФИО из списка сотрудников."
         await message.edit(text=text, attachments=[self.get_employee_selection_keyboard(prefix="emp_")],
                             format=TextFormat.HTML)
+
+    async def wizard_link_by_phone(self, event: MessageCreated, context: BaseContext):
+        """Пользователь вводит последние цифры своего номера телефона — бот ищет
+        совпадение в EMPLOYEE_PHONES и самостоятельно привязывает аккаунт к сотруднику."""
+        message_text = (event.message.body.text or "") if event.message.body else ""
+        digits = "".join(ch for ch in message_text if ch.isdigit())
+        user_id = str(event.message.sender.user_id)
+
+        if len(digits) < 4:
+            await event.message.answer(
+                "❌ <b>СЛИШКОМ КОРОТКИЙ НОМЕР</b>\n\n"
+                "Введите как минимум последние 4 цифры вашего номера телефона.",
+                format=TextFormat.HTML
+            )
+            return
+
+        matches = [
+            name for name, phone in EMPLOYEE_PHONES.items()
+            if "".join(ch for ch in phone if ch.isdigit()).endswith(digits)
+        ]
+
+        if len(matches) == 1:
+            employee_name = matches[0]
+            await context.clear()
+
+            if user_id not in self.user_data:
+                await event.message.answer(
+                    "❌ Ошибка привязки. Пожалуйста, начните снова командой /start",
+                    format=TextFormat.HTML
+                )
+                return
+
+            self.user_data[user_id]["selected_employee"] = employee_name
+            self.user_data[user_id]["registered_at"] = datetime.now().isoformat()
+            self.save_user_data()
+            audit(user_id, "phone_linked", f"{employee_name} <- {digits}")
+
+            await event.message.answer(
+                "<b>✅ АККАУНТ ПРИВЯЗАН</b>\n\n"
+                f"Вы привязаны к:\n<b>{employee_name}</b>\n\n"
+                f"📞 Телефон: {EMPLOYEE_PHONES.get(employee_name, 'не указан')}\n"
+                f"🔔 Уведомления: {'✅ Включены' if self.user_data[user_id].get('notifications', True) else '❌ Отключены'}\n\n"
+                "<i>Теперь вы можете пользоваться всеми функциями бота.</i>\n\nВыберите действие:",
+                attachments=[self.get_main_keyboard(user_id)],
+                format=TextFormat.HTML
+            )
+        elif not matches:
+            builder = InlineKeyboardBuilder()
+            builder.row(CallbackButton(text="📋 Выбрать ФИО из списка", payload="link_by_list"))
+            await event.message.answer(
+                "❌ <b>НЕ НАЙДЕНО</b>\n\n"
+                "Сотрудник с таким номером не найден. Проверьте цифры и "
+                "попробуйте снова, либо выберите ФИО из списка.",
+                attachments=[builder.as_markup()],
+                format=TextFormat.HTML
+            )
+        else:
+            await event.message.answer(
+                "⚠️ <b>НЕОДНОЗНАЧНЫЙ НОМЕР</b>\n\n"
+                "Этим цифрам соответствуют несколько сотрудников. Введите больше цифр номера.",
+                format=TextFormat.HTML
+            )
 
     async def register_employee(self, message, user_id, employee_name: str):
         if user_id in self.user_data:
