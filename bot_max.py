@@ -609,20 +609,20 @@ class ProtocolCleanupMiddleware(BaseMiddleware):
 
     @staticmethod
     def _extract_user_id(event_object) -> Optional[str]:
-        message = getattr(event_object, "message", None)
-        if message is not None:
-            sender = getattr(message, "sender", None)
-            if sender is not None:
-                return str(sender.user_id)
-        callback = getattr(event_object, "callback", None)
-        if callback is not None:
-            user = getattr(callback, "user", None)
-            if user is not None:
-                return str(user.user_id)
-        user = getattr(event_object, "user", None)
-        if user is not None:
-            return str(user.user_id)
-        return None
+        """Использует get_ids() — тот же метод, которым Dispatcher.handle()
+        сам определяет chat_id/user_id для события. Ручной разбор полей был
+        неверным: у MessageCallback event.message — это сообщение бота (на
+        котором висела кнопка), а не отправитель; правильный user —
+        event.callback.user, что get_ids() и учитывает для каждого типа
+        события."""
+        get_ids = getattr(event_object, "get_ids", None)
+        if get_ids is None:
+            return None
+        try:
+            _, user_id = get_ids()
+        except Exception:
+            return None
+        return str(user_id) if user_id is not None else None
 
     async def __call__(self, handler, event_object, data):
         user_id = self._extract_user_id(event_object)
