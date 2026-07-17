@@ -782,6 +782,8 @@ class DutyBot:
             logger.error(f"Ошибка отправки уведомления в среду: {e}")
 
     async def send_friday_notification_all(self):
+        """Пятничное напоминание — только дежурному(ым) на завтра, а не всем
+        (в отличие от среды, где 'кто дежурит' объявляется всей команде)."""
         try:
             today = datetime.now(MOSCOW_TZ).replace(tzinfo=None)
             if today.weekday() != 4:
@@ -796,42 +798,54 @@ class DutyBot:
                                  None)
 
             if not duty_tomorrow:
-                message = (
-                    f"🔔 <b>НАПОМИНАНИЕ О ЗАВТРАШНЕМ ДЕЖУРСТВЕ</b>\n\n"
-                    f"📅 <b>Завтра ({tomorrow.strftime('%d.%m.%Y')}) дежурных нет</b>\n\n"
-                    f"✅ Можете не беспокоиться!\n\n"
-                    f"<i>Следующее напоминание: суббота в 10:00</i>"
-                )
+                logger.info("Пятничное напоминание: дежурных завтра нет, отправлять некому")
+                return
+
+            if duty_tomorrow["is_pair"]:
+                duty_text = f"{duty_tomorrow['employees'][0]} + {duty_tomorrow['employees'][1]}"
+                phones_text = f"{duty_tomorrow['phones'][0]} + {duty_tomorrow['phones'][1]}"
             else:
-                if duty_tomorrow["is_pair"]:
-                    duty_text = f"{duty_tomorrow['employees'][0]} + {duty_tomorrow['employees'][1]}"
-                    phones_text = f"{duty_tomorrow['phones'][0]} + {duty_tomorrow['phones'][1]}"
-                else:
-                    duty_text = f"{duty_tomorrow['employees'][0]}"
-                    phones_text = f"{duty_tomorrow['phones'][0]}"
+                duty_text = f"{duty_tomorrow['employees'][0]}"
+                phones_text = f"{duty_tomorrow['phones'][0]}"
 
-                message = (
-                    f"🔔 <b>НАПОМИНАНИЕ О ЗАВТРАШНЕМ ДЕЖУРСТВЕ</b>\n\n"
-                    f"📅 <b>Завтра ({tomorrow.strftime('%d.%m.%Y')}) дежурит:</b>\n"
-                    f"👤 {duty_text}\n"
-                    f"📞 {phones_text}\n\n"
-                    f"⏰ <b>Время:</b> 6:50 - 8:00\n"
-                    f"📍 <b>Место:</b> кабинет 6002, 6 этаж, АДЦ\n\n"
-                    f"⚠️ <b>ВАЖНО! СЕГОДНЯ ДО 19:00:</b>\n"
-                    f"• Дежурным позвонить в приемную: 5600\n"
-                    f"• Сообщить о дежурстве\n"
-                    f"• Попросить оставить ключи на вахте\n\n"
-                    f"📋 <b>План на завтра:</b>\n"
-                    f"• Прийти в АДЦ к 6:50\n"
-                    f"• Взять ключ на охране от кубов\n"
-                    f"• Открыть кабинет 6002\n"
-                    f"• Сфотографировать открытый кабинет\n"
-                    f"• Находиться там до 8:00\n"
-                    f"• Оформить протокол разногласий\n\n"
-                    f"<i>Следующее напоминание: суббота в 10:00</i>"
-                )
+            message = (
+                f"🔔 <b>НАПОМИНАНИЕ О ЗАВТРАШНЕМ ДЕЖУРСТВЕ</b>\n\n"
+                f"📅 <b>Завтра ({tomorrow.strftime('%d.%m.%Y')}) дежурите вы:</b>\n"
+                f"👤 {duty_text}\n"
+                f"📞 {phones_text}\n\n"
+                f"⏰ <b>Время:</b> 6:50 - 8:00\n"
+                f"📍 <b>Место:</b> кабинет 6002, 6 этаж, АДЦ\n\n"
+                f"⚠️ <b>ВАЖНО! СЕГОДНЯ ДО 19:00:</b>\n"
+                f"• Позвонить в приемную: 5600\n"
+                f"• Сообщить о дежурстве\n"
+                f"• Попросить оставить ключи на вахте\n\n"
+                f"📋 <b>План на завтра:</b>\n"
+                f"• Прийти в АДЦ к 6:50\n"
+                f"• Взять ключ на охране от кубов\n"
+                f"• Открыть кабинет 6002\n"
+                f"• Сфотографировать открытый кабинет\n"
+                f"• Находиться там до 8:00\n"
+                f"• Оформить протокол разногласий\n\n"
+                f"<i>Следующее напоминание: суббота в 10:00</i>"
+            )
 
-            await self._send_notification_to_all_users(message, "пятница")
+            sent_to = 0
+            unlinked_employees = []
+            for emp in duty_tomorrow["employees"]:
+                recipients = self._get_user_ids_for_employee(emp)
+                if not recipients:
+                    unlinked_employees.append(emp)
+                for uid in recipients:
+                    try:
+                        await self.bot.send_message(user_id=int(uid), text=message, format=TextFormat.HTML)
+                        sent_to += 1
+                    except Exception as e:
+                        logger.error(f"Не удалось отправить пятничное напоминание пользователю {uid}: {e}")
+
+            if unlinked_employees:
+                logger.warning(f"Пятничное напоминание: сотрудники без привязанного аккаунта: {unlinked_employees}")
+            logger.info(f"Пятничное напоминание отправлено {sent_to} получателям (дежурные: {duty_tomorrow['employees']})")
+            audit("system", "friday_reminder_sent", f"{tomorrow.strftime('%d.%m.%Y')}, получателей: {sent_to}")
         except Exception as e:
             logger.error(f"Ошибка отправки уведомления в пятницу: {e}")
 
@@ -1821,7 +1835,7 @@ class DutyBot:
         user_id = str(event.message.sender.user_id)
         if not self.is_admin(user_id):
             return
-        await event.message.answer("🔄 Отправляю тестовое пятничное уведомление всем пользователям...")
+        await event.message.answer("🔄 Отправляю тестовое пятничное уведомление дежурному(ым)...")
         await self.send_friday_notification_all()
         await event.message.answer("✅ Тестовое пятничное уведомление отправлено!")
 
