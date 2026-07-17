@@ -2343,6 +2343,7 @@ class DutyBot:
 
     def _build_stats_text(self, period: str) -> str:
         now = datetime.now(MOSCOW_TZ).replace(tzinfo=None)
+        subtitle = ""
         if period == "week":
             since = now - timedelta(days=7)
             title = "за последнюю неделю"
@@ -2350,8 +2351,12 @@ class DutyBot:
             since = now - timedelta(days=30)
             title = "за последний месяц"
         else:
-            since = now - timedelta(days=365)
+            # Не скользящие 365 дней, а с начала текущего календарного года —
+            # так исторические дежурства (historical_shifts, начинаются с
+            # января) сразу попадают в этот период целиком.
+            since = datetime(now.year, 1, 1)
             title = "за год"
+            subtitle = f"\n<i>начиная с {since.strftime('%d.%m.%Y')}</i>"
 
         counts: Dict[str, int] = {}
         total = 0
@@ -2368,13 +2373,16 @@ class DutyBot:
                 counts[emp] = counts.get(emp, 0) + 1
                 total += 1
 
-        text = f"📊 <b>СТАТИСТИКА ДЕЖУРСТВ</b>\n<i>{title}</i>\n\n"
+        text = f"📊 <b>СТАТИСТИКА ДЕЖУРСТВ</b>\n<i>{title}</i>{subtitle}\n\n"
         if total == 0:
             text += "Нет завершённых дежурств за этот период."
         else:
             for emp, cnt in sorted(counts.items(), key=lambda x: -x[1]):
                 pct = (cnt / total) * 100
-                text += f"• <b>{emp}</b> — {cnt} ({pct:.0f}%)\n"
+                # Сотрудник, которого уже нет в системе (уволен) — зачёркиваем
+                # имя, но не убираем из статистики: он реально дежурил.
+                name = emp if emp in EMPLOYEE_PHONES else f"<s>{emp}</s>"
+                text += f"• <b>{name}</b> — {cnt} ({pct:.0f}%)\n"
             text += f"\n<b>Всего дежурств за период:</b> {total}"
 
         return text
