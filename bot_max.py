@@ -403,6 +403,48 @@ class DutyScheduleGenerator:
             return True
         return False
 
+    def swap_duties(self, date_str_a: str, date_str_b: str):
+        """Меняет местами дежурных между двумя субботами. Работает и для дат
+        с ручной правкой, и для дат, рассчитанных автоматически по кругу —
+        в любом случае обе даты становятся ручными правками (как в add_duty),
+        чтобы обмен пережил рестарт бота."""
+        if not date_str_a.endswith("г."):
+            date_str_a += "г."
+        if not date_str_b.endswith("г."):
+            date_str_b += "г."
+
+        if date_str_a == date_str_b:
+            return False, "Даты совпадают — нечего менять местами"
+
+        current_schedule = self._generate_dynamic_schedule()
+        duty_a = current_schedule.get(date_str_a)
+        duty_b = current_schedule.get(date_str_b)
+
+        if not duty_a or not duty_b:
+            missing = date_str_a if not duty_a else date_str_b
+            return False, f"Дежурство на {missing} не найдено в графике (проверьте дату и что это суббота из ближайших 12 недель)"
+
+        for date_str, other_duty in ((date_str_a, duty_b), (date_str_b, duty_a)):
+            date_obj = current_schedule[date_str]["date_obj"]
+            self.schedule[date_str] = {
+                "employees": other_duty["employees"],
+                "phones": other_duty["phones"],
+                "is_pair": other_duty["is_pair"],
+                "date_obj": date_obj
+            }
+            self.schedule_data = [d for d in self.schedule_data if d["date"] != date_str]
+            self.schedule_data.append({
+                "date": date_str,
+                "date_obj": date_obj,
+                "employees": other_duty["employees"],
+                "phones": other_duty["phones"],
+                "is_pair": other_duty["is_pair"]
+            })
+
+        self._save_overrides()
+        logger.info(f"Дежурства обменяны местами: {date_str_a} <-> {date_str_b}")
+        return True, (date_str_a, duty_a["employees"], date_str_b, duty_b["employees"])
+
     def update_employee_phone(self, employee_name: str, new_phone: str) -> bool:
         global EMPLOYEE_PHONES
         if employee_name in EMPLOYEE_PHONES:
@@ -436,17 +478,66 @@ class DutyScheduleGenerator:
             return True
         return False
 
-    def remove_employee(self, employee_name: str) -> bool:
+    def remove_employee(self, employee_name: str):
         global EMPLOYEE_PHONES
-        if employee_name in EMPLOYEE_PHONES:
-            del EMPLOYEE_PHONES[employee_name]
-            # Иначе уволенный сотрудник продолжал бы вечно попадать в круг
-            # дежурств — ротация просто пропускает его теперь.
-            while employee_name in DUTY_ROTATION_CIRCLE:
-                DUTY_ROTATION_CIRCLE.remove(employee_name)
-            logger.info(f"Удален сотрудник: {employee_name}")
-            return True
-        return False
+        if employee_name not in EMPLOYEE_PHONES:
+            return False, []
+
+        del EMPLOYEE_PHONES[employee_name]
+        # Иначе уволенный сотрудник продолжал бы вечно попадать в круг
+        # дежурств — ротация просто пропускает его теперь.
+        while employee_name in DUTY_ROTATION_CIRCLE:
+            DUTY_ROTATION_CIRCLE.remove(employee_name)
+
+        affected_dates = self._remove_employee_from_overrides(employee_name)
+
+        logger.info(f"Удален сотрудник: {employee_name}")
+        return True, affected_dates
+
+    def _remove_employee_from_overrides(self, employee_name: str) -> List[str]:
+        """Чистит ручные правки графика (add_duty/swap_duties) от уволенного
+        сотрудника. Без этого ручные даты не пересчитываются сами (в отличие
+        от авто-круга) и уволенный продолжал бы значиться дежурным на них."""
+        affected_dates = []
+
+        for date_str, duty in list(self.schedule.items()):
+            if employee_name not in duty["employees"]:
+                continue
+
+            affected_dates.append(date_str)
+            partner_index = 1 - duty["employees"].index(employee_name) if duty["is_pair"] else None
+            # Пара технически могла ссылаться на одного и того же сотрудника
+            # дважды (старый пробел в клавиатуре выбора второго дежурного,
+            # исправлен отдельно) — тогда "напарник" это тоже employee_name,
+            # и оставлять его дежурным нельзя, дата должна очиститься целиком.
+            if duty["is_pair"] and duty["employees"][partner_index] != employee_name:
+                self.schedule[date_str] = {
+                    "employees": [duty["employees"][partner_index]],
+                    "phones": [duty["phones"][partner_index]],
+                    "is_pair": False,
+                    "date_obj": duty["date_obj"]
+                }
+            else:
+                del self.schedule[date_str]
+
+        if affected_dates:
+            # Пересобираем schedule_data из актуального self.schedule, а не
+            # патчим точечно — так заодно схлопываются дубликаты по дате,
+            # которые мог накопить add_duty при повторном редактировании.
+            self.schedule_data = [
+                {
+                    "date": date_str,
+                    "date_obj": duty["date_obj"],
+                    "employees": duty["employees"],
+                    "phones": duty["phones"],
+                    "is_pair": duty["is_pair"]
+                }
+                for date_str, duty in self.schedule.items()
+            ]
+            self._save_overrides()
+            logger.info(f"Ручные правки графика скорректированы после удаления {employee_name}: {affected_dates}")
+
+        return affected_dates
 
 
 class AdminWizard(StatesGroup):
@@ -537,6 +628,7 @@ class DutyBot:
         dp.message_created(Command("set_phone"))(self.cmd_set_phone)
         dp.message_created(Command("set_schedule"))(self.cmd_set_schedule)
         dp.message_created(Command("myid"))(self.cmd_myid)
+        dp.message_created(Command("help"))(self.cmd_help)
         dp.message_created(Command("test_protocol"))(self.send_test_protocol)
 
         dp.message_callback()(self.on_callback)
@@ -1194,11 +1286,34 @@ class DutyBot:
             CallbackButton(text="➕ Добавить дежурство", payload="admin_add_duty"),
             CallbackButton(text="➖ Удалить дежурство", payload="admin_remove_duty"),
         )
+        kb.row(CallbackButton(text="🔀 Поменять дежурства местами", payload="admin_swap_duty"))
         kb.row(
             CallbackButton(text="📋 Просмотреть график", payload="full_schedule"),
             CallbackButton(text="🔄 Обновить график", payload="admin_refresh_schedule"),
         )
         kb.row(CallbackButton(text="🔙 Назад в админку", payload="admin_panel"))
+        return kb.as_markup()
+
+    def get_duty_date_selection_keyboard(self, prefix: str, exclude_date: Optional[str] = None):
+        """Клавиатура выбора даты дежурства из ближайших 12 недель графика —
+        кнопка подписана датой и текущим дежурным(и), чтобы было видно, кого
+        меняешь, не сверяясь отдельно со списком графика."""
+        kb = InlineKeyboardBuilder()
+        current_schedule = self.schedule_generator._generate_dynamic_schedule()
+        duties_list = sorted(current_schedule.items(), key=lambda x: x[1]["date_obj"])
+
+        buttons = []
+        for date_str, duty in duties_list:
+            if date_str == exclude_date:
+                continue
+            date_short = date_str.replace("г.", "")
+            names = " + ".join(duty["employees"])
+            buttons.append(CallbackButton(text=f"{date_short} — {names}", payload=f"{prefix}{date_str}"))
+
+        for button in buttons:
+            kb.row(button)
+
+        kb.row(CallbackButton(text="❌ Отмена", payload="admin_schedule"))
         return kb.as_markup()
 
     def get_employees_admin_keyboard(self):
@@ -1232,9 +1347,9 @@ class DutyBot:
         kb.row(CallbackButton(text="🔙 Назад в меню", payload="back_to_main"))
         return kb.as_markup()
 
-    def get_employee_selection_keyboard(self, prefix: str = "emp_"):
+    def get_employee_selection_keyboard(self, prefix: str = "emp_", exclude: Optional[str] = None):
         kb = InlineKeyboardBuilder()
-        employees_list = list(EMPLOYEE_PHONES.keys())
+        employees_list = [e for e in EMPLOYEE_PHONES.keys() if e != exclude]
 
         for i in range(0, len(employees_list), 2):
             row_buttons = [CallbackButton(text=employees_list[i], payload=f"{prefix}{employees_list[i]}")]
@@ -1852,7 +1967,7 @@ class DutyBot:
         # привязаться к чужому имени без знания номера) — теперь только админ.
         is_admin_only_payload = (
             payload.startswith("admin_") or payload == "admin_add_duty"
-            or payload.startswith(("add_type_", "add_e1_", "add_e2_"))
+            or payload.startswith(("add_type_", "add_e1_", "add_e2_", "swap1_", "swap2_"))
             or payload.startswith("emp_") or payload == "link_by_list"
         )
         if is_admin_only_payload and not self.is_authorized_admin(user_id):
@@ -1877,6 +1992,7 @@ class DutyBot:
             "admin_stats": self.show_admin_stats,
             "admin_duty_reports": self.show_duty_reports_list,
             "admin_remove_duty": self.admin_remove_duty,
+            "admin_swap_duty": self.admin_swap_duty,
             "admin_add_employee": self.admin_add_employee,
             "admin_remove_employee": self.admin_remove_employee,
             "admin_edit_phone": self.admin_edit_phone,
@@ -1933,7 +2049,7 @@ class DutyBot:
             if duty["is_pair"]:
                 await message.edit(
                     text=f"✅ Выбран первый: <b>{name}</b>\n\n👥 <b>Шаг 4:</b> Выберите второго дежурного:",
-                    attachments=[self.get_employee_selection_keyboard("add_e2_")],
+                    attachments=[self.get_employee_selection_keyboard("add_e2_", exclude=name)],
                     format=TextFormat.HTML
                 )
             else:
@@ -1955,6 +2071,12 @@ class DutyBot:
                       "📞 <b>Шаг 5:</b> Введите телефоны через запятую.\n\n<i>Лайфхак: Напишите в чат слово <b>ок</b>, и бот сам подставит номера обоих сотрудников!</i>"),
                 format=TextFormat.HTML
             )
+
+        elif payload.startswith("swap1_"):
+            await self.swap_duty_pick_first(message, user_id, context, payload[len("swap1_"):])
+
+        elif payload.startswith("swap2_"):
+            await self.swap_duty_pick_second(message, user_id, context, payload[len("swap2_"):])
 
         elif payload.startswith("access_approve|") or payload.startswith("access_deny|"):
             approved = payload.startswith("access_approve|")
@@ -2156,6 +2278,54 @@ class DutyBot:
             f"в config.json (или CONFIG_JSON) -> <code>admin_ids</code>.",
             format=TextFormat.HTML
         )
+
+    async def cmd_help(self, event: MessageCreated):
+        """/help — список доступных команд. MAX не даёт надёжно показать
+        автодополнение команд при наборе "/" (метод API для этого — set_my_commands/
+        change_info — помечен в maxapi устаревшим и не соответствующим текущему
+        API), поэтому вместо автодополнения — команда со списком. Также
+        вызывается из on_plain_text на любой нераспознанный текст с "/", чтобы
+        ввод "/" тоже показывал список.
+
+        sender может быть None (см. on_plain_text) — тогда просто считаем
+        пользователя не-админом, а не падаем."""
+        sender = event.message.sender
+        user_id = str(sender.user_id) if sender else None
+        is_admin_user = bool(user_id) and self.is_authorized_admin(user_id)
+
+        text = (
+            "🤖 <b>КОМАНДЫ БОТА</b>\n\n"
+            "<b>👤 Для всех пользователей:</b>\n"
+            "/start — регистрация и привязка аккаунта к сотруднику\n"
+            "/stats — статистика дежурств\n"
+            "/contact — мой профиль (сотрудник + телефон)\n"
+            "/myid — узнать свой числовой ID\n"
+            "/help — этот список команд\n"
+        )
+
+        if is_admin_user:
+            text += (
+                "\n<b>⚙️ Для администратора:</b>\n"
+                "/admin логин пароль — вход в админ-панель\n"
+                "/set_phone — изменить телефон сотрудника\n"
+                "/set_schedule — управление графиком дежурств\n"
+                "/reset_shifts confirm — очистить историю дежурств (необратимо!)\n"
+                "\n<b>🧪 Диагностические (для отладки):</b>\n"
+                "/users — статус зарегистрированных пользователей\n"
+                "/enable_all — включить уведомления всем\n"
+                "/test_send — тестовая отправка сообщения\n"
+                "/time — проверить текущее время/часовой пояс бота\n"
+                "/fix — исправить данные пользователей\n"
+                "/test_wednesday, /test_friday, /test_saturday — тест уведомлений по дням\n"
+                "/test_report — тест запроса фотоотчёта\n"
+                "/test_protocol — тест генерации протокола\n"
+                "/test_protocol_reminder — тест напоминания о бланке протокола\n"
+                "/test_user &lt;id&gt; — тестовое уведомление конкретному пользователю\n"
+            )
+        else:
+            text += "\n<i>Команды администратора появятся здесь после входа в админку (/admin).</i>"
+
+        await event.message.answer(text, format=TextFormat.HTML)
 
     # ================= ЗАЩИТА ОТ ПОСТОРОННИХ (ТЗ п.2.4) =================
 
@@ -2457,6 +2627,7 @@ class DutyBot:
             "Доступные действия:\n\n"
             "➕ <b>Добавить дежурство:</b>\nСоздать новую ручную запись в графике поверх круга\n\n"
             "➖ <b>Удалить дежурство:</b>\nУдалить существующую ручную правку\n\n"
+            "🔀 <b>Поменять дежурства местами:</b>\nОбменять дежурных между двумя датами\n\n"
             "📋 <b>Просмотреть график:</b>\nПосмотреть текущий график\n\n"
             "🔄 <b>Обновить график:</b>\nОбновить отображение графика\n\n"
             "<i>Выберите действие:</i>"
@@ -2612,6 +2783,16 @@ class DutyBot:
         kb.row(CallbackButton(text="❌ Отмена", payload="admin_schedule"))
         await message.edit(text=text, attachments=[kb.as_markup()], format=TextFormat.HTML)
         await context.set_state(AdminWizard.awaiting_duty_remove)
+
+    async def admin_swap_duty(self, message, user_id, context: BaseContext):
+        if context:
+            await context.clear()
+        text = "🔀 <b>ОБМЕН ДЕЖУРСТВАМИ</b>\n\n<b>Шаг 1:</b> Выберите первую дату:"
+        await message.edit(
+            text=text,
+            attachments=[self.get_duty_date_selection_keyboard("swap1_")],
+            format=TextFormat.HTML
+        )
 
     async def admin_add_employee(self, message, user_id, context: BaseContext):
         text = (
@@ -2836,6 +3017,60 @@ class DutyBot:
             )
         await context.clear()
 
+    async def swap_duty_pick_first(self, message, user_id, context: BaseContext, date_str_a: str):
+        """Шаг 1 обмена (payload 'swap1_<дата>') — запоминаем первую дату
+        в FSM-данных и показываем список дат для второго выбора."""
+        await context.update_data(swap_date_a=date_str_a)
+        date_short = date_str_a.replace("г.", "")
+        text = (
+            f"🔀 <b>ОБМЕН ДЕЖУРСТВАМИ</b>\n\n"
+            f"✅ Первая дата: <b>{date_short}</b>\n\n"
+            "<b>Шаг 2:</b> Выберите вторую дату:"
+        )
+        await message.edit(
+            text=text,
+            attachments=[self.get_duty_date_selection_keyboard("swap2_", exclude_date=date_str_a)],
+            format=TextFormat.HTML
+        )
+
+    async def swap_duty_pick_second(self, message, user_id, context: BaseContext, date_str_b: str):
+        """Шаг 2 обмена (payload 'swap2_<дата>') — выполняет обмен между
+        сохранённой первой датой и только что выбранной второй."""
+        data = await context.get_data()
+        date_str_a = data.get("swap_date_a")
+        await context.clear()
+
+        if not date_str_a:
+            await message.edit(
+                text="❌ <b>СЕССИЯ ОБМЕНА ПОТЕРЯНА</b>\n\nНачните заново: «🔀 Поменять дежурства местами».",
+                attachments=[self.get_schedule_admin_keyboard()],
+                format=TextFormat.HTML
+            )
+            return
+
+        success, result = self.schedule_generator.swap_duties(date_str_a, date_str_b)
+
+        if success:
+            date_a, employees_a, date_b, employees_b = result
+            audit(user_id, "duty_swapped",
+                  f"{date_a}:{', '.join(employees_a)} <-> {date_b}:{', '.join(employees_b)}")
+            await message.edit(
+                text=(
+                    "✅ <b>ДЕЖУРСТВА ОБМЕНЯНЫ</b>\n\n"
+                    f"📅 {date_a} → {', '.join(employees_b)}\n"
+                    f"📅 {date_b} → {', '.join(employees_a)}\n\n"
+                    "<i>График успешно обновлён.</i>"
+                ),
+                attachments=[self.get_schedule_admin_keyboard()],
+                format=TextFormat.HTML
+            )
+        else:
+            await message.edit(
+                text=f"❌ <b>ОШИБКА ОБМЕНА</b>\n\n{result}",
+                attachments=[self.get_schedule_admin_keyboard()],
+                format=TextFormat.HTML
+            )
+
     async def wizard_employee_add(self, event: MessageCreated, context: BaseContext):
         message_text = event.message.body.text or ""
         try:
@@ -2869,7 +3104,7 @@ class DutyBot:
 
     async def wizard_employee_remove(self, event: MessageCreated, context: BaseContext):
         employee_name = (event.message.body.text or "").strip()
-        success = self.schedule_generator.remove_employee(employee_name)
+        success, affected_dates = self.schedule_generator.remove_employee(employee_name)
 
         if success:
             for info in self.user_data.values():
@@ -2878,9 +3113,15 @@ class DutyBot:
             self.save_user_data()
 
             audit(str(event.message.sender.user_id),
-                  "employee_removed", employee_name)
+                  "employee_removed", f"{employee_name}; график скорректирован: {', '.join(affected_dates) or '—'}")
+
+            schedule_note = (
+                f"\n\n📅 <b>Скорректирован график на:</b> {', '.join(d.replace('г.', '') for d in affected_dates)}\n"
+                "<i>Даты с парным дежурством оставлены на втором дежурном, остальные вернулись к авто-кругу.</i>"
+                if affected_dates else ""
+            )
             await event.message.answer(
-                f"✅ <b>СОТРУДНИК УДАЛЕН</b>\n\n👤 ФИО: {employee_name}\n\n<i>Сотрудник удален из системы.</i>",
+                f"✅ <b>СОТРУДНИК УДАЛЕН</b>\n\n👤 ФИО: {employee_name}\n\n<i>Сотрудник удален из системы.</i>{schedule_note}",
                 format=TextFormat.HTML
             )
         else:
@@ -3038,6 +3279,9 @@ class DutyBot:
         message_text = (body.text if body else "") or ""
 
         if message_text.startswith('/'):
+            # Неизвестная команда (или просто "/") — показываем список
+            # доступных команд вместо молчания.
+            await self.cmd_help(event)
             return
 
         sender = event.message.sender
