@@ -1,4 +1,4 @@
-maxapi
+https://github.com/love-apples/maxapi/archive/refs/heads/main.zip
 pytz
 apscheduler
 python-dotenv
