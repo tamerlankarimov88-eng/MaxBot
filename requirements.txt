@@ -1,4 +1,4 @@
-max-bot-api
+git+https://github.com/love-apples/maxapi.git
 pytz
 apscheduler
 python-dotenv
