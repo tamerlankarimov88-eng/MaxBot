@@ -1,0 +1,31 @@
+{
+  "admin_login": "AdminDuty",
+  "admin_password": "замените_на_сложный_пароль",
+  "employee_phones": {
+    "Фамилия И.О.": "8-000-000-00-00"
+  },
+  "duty_rotation_circle": [
+    "Фамилия И.О."
+  ],
+  "duty_schedule": [
+    {
+      "date": "01.01.2026",
+      "employees": ["Фамилия И.О."],
+      "phones": ["8-000-000-00-00"],
+      "is_pair": false
+    }
+  ],
+  "historical_shifts": [
+    {
+      "date": "01.01.2026",
+      "employees": ["Фамилия И.О."]
+    }
+  ],
+  "admin_ids": [123456789],
+  "whitelist_mode": false,
+  "survey": {
+    "send_hour": 8,
+    "send_minute": 0
+  },
+  "protocol_filename_mask": "Протокол Разногласий_{date}_Смена{shift_number}.docx"
+}
